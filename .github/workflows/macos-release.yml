@@ -1,0 +1,87 @@
+name: macOS release build
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      universal:
+        description: "Build a universal CI artifact; tag builds are always universal"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-package:
+    # SpeechAnalyzer symbols require the macOS 26 SDK.
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          swift --version
+          xcrun --sdk macosx --show-sdk-version
+
+      - name: Run Swift tests
+        env:
+          TMPDIR: /tmp
+        run: swift test -j 4
+
+      - name: Run lifecycle regression runner
+        env:
+          TMPDIR: /tmp
+        run: swift run -j 4 MoMoWhisperLifecycleTestRunner
+
+      - name: Build ad-hoc CI artifacts
+        env:
+          TMPDIR: /tmp
+          MOMO_WHISPER_BUILD_NUMBER: ${{ github.run_number }}
+          REQUEST_UNIVERSAL: ${{ inputs.universal || 'false' }}
+        run: |
+          version="0.1.0"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            REQUEST_UNIVERSAL="true"
+          fi
+
+          args=()
+          if [[ "$REQUEST_UNIVERSAL" == "true" ]]; then
+            args+=(--universal)
+          fi
+
+          MOMO_WHISPER_VERSION="$version" bash scripts/package-macos.sh "${args[@]}"
+
+      - name: Verify ad-hoc DMG and ZIP structure
+        env:
+          TMPDIR: /tmp
+        run: |
+          dmg="$(find dist/macos -maxdepth 1 -name '*.dmg' -print -quit)"
+          zip="$(find dist/macos -maxdepth 1 -name '*.zip' -print -quit)"
+          [[ -n "$dmg" && -n "$zip" ]]
+
+          expected_arch="arm64"
+          if [[ "$dmg" == *-universal-* ]]; then
+            expected_arch="universal"
+          fi
+
+          bash scripts/verify-macos-release.sh --allow-adhoc --expected-arch "$expected_arch" "$dmg"
+          bash scripts/verify-macos-release.sh --allow-adhoc --expected-arch "$expected_arch" "$zip"
+
+      - name: Upload CI artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: momowhisper-macos-${{ github.run_number }}
+          path: dist/macos/*
+          if-no-files-found: error
+          retention-days: 14

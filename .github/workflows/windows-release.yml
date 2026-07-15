@@ -1,0 +1,329 @@
+name: Windows Beta installer
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_VERSION: "8.0.423"
+  INNO_SETUP_VERSION: "6.7.1"
+  WHISPER_CPP_COMMIT: "f049fff95a089aa9969deb009cdd4892b3e74916"
+  WHISPER_CPP_SOURCE_SHA256: "58347c4dc92142c47b6d6e5a2a7e1b00b501c9bf8cdaff7f089e49ae59eb3a44"
+  WHISPER_MODEL_SHA256: "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe"
+
+jobs:
+  build-windows-beta:
+    name: Build and package Windows x64 Beta
+    runs-on: windows-2022
+    timeout-minutes: 45
+    outputs:
+      package-version: ${{ steps.package_version.outputs.version }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Resolve package version
+        id: package_version
+        shell: pwsh
+        run: |
+          $version = "0.1.0-beta.${{ github.run_number }}"
+          if ($env:GITHUB_REF -like "refs/tags/v*") {
+            $version = $env:GITHUB_REF_NAME.Substring(1)
+          }
+          if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$') {
+            throw "Invalid Windows Beta version: $version"
+          }
+          "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Restore
+        shell: pwsh
+        run: dotnet restore windows/MoMoWhisper.Windows.sln
+
+      - name: Test portable Windows core
+        shell: pwsh
+        run: >-
+          dotnet test
+          windows/tests/MoMoWhisper.Windows.Core.Tests/MoMoWhisper.Windows.Core.Tests.csproj
+          --configuration Release
+          --no-restore
+          -p:Version=$env:APP_VERSION
+          --logger "console;verbosity=normal"
+
+      - name: Publish self-contained WinForms app
+        shell: pwsh
+        run: >-
+          dotnet publish
+          windows/src/MoMoWhisper.Windows/MoMoWhisper.Windows.csproj
+          --configuration Release
+          --runtime win-x64
+          --self-contained true
+          -p:Version=$env:APP_VERSION
+          --output windows/artifacts/publish
+
+      - name: Build and verify static whisper.cpp CLI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $archive = Join-Path $env:RUNNER_TEMP "whisper.cpp-source.zip"
+          $extract = Join-Path $env:RUNNER_TEMP "whisper.cpp-source"
+          $build = Join-Path $env:RUNNER_TEMP "whisper.cpp-build"
+          $url = "https://codeload.github.com/ggml-org/whisper.cpp/zip/$env:WHISPER_CPP_COMMIT"
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($actual -ne $env:WHISPER_CPP_SOURCE_SHA256) {
+            throw "whisper.cpp source SHA-256 mismatch: $actual"
+          }
+          Expand-Archive -Path $archive -DestinationPath $extract -Force
+          $source = Join-Path $extract "whisper.cpp-$env:WHISPER_CPP_COMMIT"
+          cmake `
+            -S $source `
+            -B $build `
+            -A x64 `
+            -DBUILD_SHARED_LIBS=OFF `
+            -DGGML_STATIC=ON `
+            -DGGML_NATIVE=OFF `
+            -DGGML_OPENMP=OFF `
+            -DWHISPER_BUILD_TESTS=OFF `
+            -DWHISPER_BUILD_EXAMPLES=ON `
+            -DWHISPER_BUILD_SERVER=OFF `
+            -DWHISPER_SDL2=OFF `
+            -DWHISPER_CURL=OFF `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          if ($LASTEXITCODE -ne 0) {
+            throw "whisper.cpp CMake configure failed with exit code $LASTEXITCODE"
+          }
+          cmake --build $build --config Release --target whisper-cli --parallel
+          if ($LASTEXITCODE -ne 0) {
+            throw "whisper.cpp static build failed with exit code $LASTEXITCODE"
+          }
+
+          $builtCli = Join-Path $build "bin/Release/whisper-cli.exe"
+          if (-not (Test-Path $builtCli)) {
+            throw "Static whisper-cli.exe was not produced at the expected path."
+          }
+          $destination = "windows/artifacts/publish/tools/whisper"
+          New-Item -ItemType Directory -Force -Path $destination | Out-Null
+          Copy-Item -Path $builtCli -Destination (Join-Path $destination "whisper-cli.exe") -Force
+          $packagedFiles = @(Get-ChildItem $destination -File)
+          if ($packagedFiles.Count -ne 1 -or $packagedFiles[0].Name -ne "whisper-cli.exe") {
+            throw "The packaged whisper runtime must contain only whisper-cli.exe."
+          }
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installation = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          $vcTools = Get-ChildItem (Join-Path $installation "VC/Tools/MSVC") -Directory |
+            Sort-Object Name -Descending |
+            Select-Object -First 1
+          $dumpbin = Join-Path $vcTools.FullName "bin/Hostx64/x64/dumpbin.exe"
+          if (-not (Test-Path $dumpbin)) {
+            throw "dumpbin.exe was not found for dependency verification."
+          }
+          $dependencyOutput = & $dumpbin /dependents (Join-Path $destination "whisper-cli.exe") 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            throw "dumpbin dependency inspection failed."
+          }
+          $forbiddenDependencies = @($dependencyOutput | Where-Object {
+            $_ -match '(?i)(MSVCP\d+|VCRUNTIME\d+|whisper\.dll|ggml[^ ]*\.dll)'
+          })
+          if ($forbiddenDependencies.Count -gt 0) {
+            throw "whisper-cli.exe is not self-contained: $($forbiddenDependencies -join '; ')"
+          }
+
+          $PSNativeCommandUseErrorActionPreference = $false
+          & (Join-Path $destination "whisper-cli.exe") -h
+          if ($LASTEXITCODE -ne 0) {
+            throw "Static whisper-cli.exe launch smoke failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Download and verify multilingual base model
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $models = "windows/artifacts/publish/models"
+          New-Item -ItemType Directory -Force -Path $models | Out-Null
+          $model = Join-Path $models "ggml-base.bin"
+          Invoke-WebRequest `
+            -Uri "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin" `
+            -OutFile $model
+          $actual = (Get-FileHash -Algorithm SHA256 $model).Hash.ToLowerInvariant()
+          if ($actual -ne $env:WHISPER_MODEL_SHA256) {
+            throw "ggml-base.bin SHA-256 mismatch: $actual"
+          }
+          Copy-Item LICENSE windows/artifacts/publish/LICENSE.txt
+          Copy-Item windows/THIRD_PARTY_NOTICES.md windows/artifacts/publish/THIRD_PARTY_NOTICES.md
+          Copy-Item windows/README.md windows/artifacts/publish/WINDOWS_BETA_README.md
+
+      - name: Verify published application version and executable smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $application = "windows/artifacts/publish/MoMoWhisper.Windows.exe"
+          $productVersion = (Get-Item $application).VersionInfo.ProductVersion
+          if (-not $productVersion.StartsWith($env:APP_VERSION, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Published ProductVersion '$productVersion' does not match '$env:APP_VERSION'."
+          }
+          & $application --smoke-test
+          if ($LASTEXITCODE -ne 0) {
+            throw "Published application smoke test failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Verify runner-provided Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            throw "Pinned windows-2022 runner does not contain the expected Inno Setup compiler."
+          }
+          $installedVersion = (Get-Item $iscc).VersionInfo.ProductVersion
+          if (-not $installedVersion.StartsWith($env:INNO_SETUP_VERSION, [StringComparison]::Ordinal)) {
+            throw "Expected Inno Setup $env:INNO_SETUP_VERSION, found $installedVersion."
+          }
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          $source = (Resolve-Path "windows/artifacts/publish").Path
+          $output = Join-Path $env:GITHUB_WORKSPACE "windows/artifacts/installer"
+          New-Item -ItemType Directory -Force -Path $output | Out-Null
+          & $iscc `
+            "/DSourceDir=$source" `
+            "/DOutputDir=$output" `
+            "/DAppVersion=$env:APP_VERSION" `
+            "windows/installer/MoMoWhisper.Windows.iss"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Silent-install and execute installed smoke test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = @(Get-ChildItem "windows/artifacts/installer/*-Setup.exe" -File)
+          if ($installer.Count -ne 1) {
+            throw "Expected exactly one installer, found $($installer.Count)."
+          }
+          $installDirectory = Join-Path $env:RUNNER_TEMP "MoMoWhisper-Windows-Beta-smoke"
+          $installProcess = Start-Process `
+            -FilePath $installer[0].FullName `
+            -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/DIR=$installDirectory") `
+            -Wait `
+            -PassThru
+          if ($installProcess.ExitCode -notin @(0, 3010)) {
+            throw "Silent installer smoke failed with exit code $($installProcess.ExitCode)."
+          }
+
+          $installedApplication = Join-Path $installDirectory "MoMoWhisper.Windows.exe"
+          if (-not (Test-Path $installedApplication)) {
+            throw "The silent installer did not create MoMoWhisper.Windows.exe."
+          }
+          $applicationProcess = Start-Process `
+            -FilePath $installedApplication `
+            -ArgumentList "--smoke-test" `
+            -Wait `
+            -PassThru
+          if ($applicationProcess.ExitCode -ne 0) {
+            throw "Installed application smoke failed with exit code $($applicationProcess.ExitCode)."
+          }
+
+          $uninstaller = Join-Path $installDirectory "unins000.exe"
+          if (-not (Test-Path $uninstaller)) {
+            throw "The silent installer did not create an uninstaller."
+          }
+          $uninstallProcess = Start-Process `
+            -FilePath $uninstaller `
+            -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") `
+            -Wait `
+            -PassThru
+          if ($uninstallProcess.ExitCode -notin @(0, 3010)) {
+            throw "Silent uninstall smoke failed with exit code $($uninstallProcess.ExitCode)."
+          }
+
+      - name: Create release checksums
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem "windows/artifacts/installer" -File
+          if ($files.Count -eq 0) {
+            throw "Installer output is empty."
+          }
+          $lines = foreach ($file in $files) {
+            $hash = (Get-FileHash -Algorithm SHA256 $file.FullName).Hash.ToLowerInvariant()
+            "$hash  $($file.Name)"
+          }
+          $lines | Set-Content "windows/artifacts/installer/MoMoWhisper-Windows-Beta-SHA256SUMS.txt" -Encoding ascii
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: MoMoWhisper-Windows-Beta-${{ steps.package_version.outputs.version }}-x64
+          path: windows/artifacts/installer/*
+          if-no-files-found: error
+
+  publish-tagged-release:
+    name: Upload tagged Windows Beta prerelease
+    needs: build-windows-beta
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out release notes
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Download verified installer artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: MoMoWhisper-Windows-Beta-${{ needs.build-windows-beta.outputs.package-version }}-x64
+          path: windows-assets
+
+      - name: Create or update tagged GitHub prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          shopt -s nullglob
+          assets=(windows-assets/*)
+          if (( ${#assets[@]} == 0 )); then
+            echo "No verified Windows assets were downloaded." >&2
+            exit 1
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            existing_assets="$(gh release view "$tag" --json assets --jq '.assets[].name')"
+            for asset in "${assets[@]}"; do
+              asset_name="$(basename "$asset")"
+              if grep -Fxq "$asset_name" <<<"$existing_assets"; then
+                echo "Release asset already exists and will not be overwritten: $asset_name" >&2
+                exit 1
+              fi
+            done
+            gh release upload "$tag" "${assets[@]}"
+          else
+            gh release create "$tag" \
+              --title "MoMoWhisper ${{ needs.build-windows-beta.outputs.package-version }}" \
+              --notes-file RELEASE_NOTES.md \
+              --prerelease \
+              "${assets[@]}"
+          fi
