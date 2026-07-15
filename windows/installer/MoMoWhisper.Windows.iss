@@ -31,7 +31,6 @@ SetupLogging=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
-Name: "chinesetraditional"; MessagesFile: "compiler:Languages\ChineseTraditional.isl"
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs

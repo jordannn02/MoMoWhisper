@@ -89,7 +89,9 @@ bundled.
 The installer is built with Inno Setup 6.7.1. Inno is a build-time tool; its
 compiler is not shipped as an application dependency. See
 `THIRD_PARTY_NOTICES.md` for the .NET, NAudio, whisper/model, and Inno license
-inventory. The installer also carries the root project as `LICENSE.txt`.
+inventory. The installer also carries the root project as `LICENSE.txt`. The
+current installer wizard uses Inno Setup's built-in English messages; the
+application interface and generated artifacts remain Traditional Chinese.
 
 ## CI release behavior
 
