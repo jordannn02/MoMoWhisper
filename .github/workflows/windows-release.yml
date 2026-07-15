@@ -206,8 +206,14 @@ jobs:
           if (-not (Test-Path $iscc)) {
             throw "Pinned windows-2022 runner does not contain the expected Inno Setup compiler."
           }
-          $installedVersion = (Get-Item $iscc).VersionInfo.ProductVersion
-          if (-not $installedVersion.StartsWith($env:INNO_SETUP_VERSION, [StringComparison]::Ordinal)) {
+          $packageLine = @(& choco list innosetup --exact --limit-output) |
+            Where-Object { $_ -match '(?i)^innosetup\|' } |
+            Select-Object -First 1
+          if ($LASTEXITCODE -ne 0 -or -not $packageLine) {
+            throw "Could not verify the runner-provided Inno Setup package version."
+          }
+          $installedVersion = ($packageLine -split '\|', 2)[1]
+          if ($installedVersion -ne $env:INNO_SETUP_VERSION) {
             throw "Expected Inno Setup $env:INNO_SETUP_VERSION, found $installedVersion."
           }
 
