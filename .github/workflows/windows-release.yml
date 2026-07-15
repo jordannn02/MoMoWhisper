@@ -38,6 +38,14 @@ jobs:
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
 
+      - name: Verify pinned .NET SDK
+        shell: pwsh
+        run: |
+          $actual = dotnet --version
+          if ($actual -ne $env:DOTNET_VERSION) {
+            throw "Expected .NET SDK $env:DOTNET_VERSION, found $actual."
+          }
+
       - name: Resolve package version
         id: package_version
         shell: pwsh
