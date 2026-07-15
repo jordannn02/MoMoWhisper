@@ -190,9 +190,13 @@ jobs:
           if (-not $productVersion.StartsWith($env:APP_VERSION, [StringComparison]::OrdinalIgnoreCase)) {
             throw "Published ProductVersion '$productVersion' does not match '$env:APP_VERSION'."
           }
-          & $application --smoke-test
-          if ($LASTEXITCODE -ne 0) {
-            throw "Published application smoke test failed with exit code $LASTEXITCODE"
+          $applicationProcess = Start-Process `
+            -FilePath $application `
+            -ArgumentList "--smoke-test" `
+            -Wait `
+            -PassThru
+          if ($applicationProcess.ExitCode -ne 0) {
+            throw "Published application smoke test failed with exit code $($applicationProcess.ExitCode)"
           }
 
       - name: Verify runner-provided Inno Setup
