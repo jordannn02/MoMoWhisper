@@ -105,6 +105,7 @@ jobs:
             -DWHISPER_BUILD_SERVER=OFF `
             -DWHISPER_SDL2=OFF `
             -DWHISPER_CURL=OFF `
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW `
             -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
           if ($LASTEXITCODE -ne 0) {
             throw "whisper.cpp CMake configure failed with exit code $LASTEXITCODE"
