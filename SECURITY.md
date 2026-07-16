@@ -20,7 +20,7 @@ Please include:
 
 ## Release safety
 
-Download public builds only from this repository's GitHub Releases. A public macOS build should be Developer ID signed, notarized by Apple, and accompanied by SHA-256 checksums. Artifacts labeled `unsigned` or `ad-hoc` are for local development and CI structure checks only.
+Download public builds only from this repository's GitHub Releases. A normal-distribution macOS build should be Developer ID signed, notarized by Apple, and accompanied by SHA-256 checksums. A Release may include an explicitly approved artifact labeled `unsigned` only as a Beta exception with checksums, an unambiguous Gatekeeper warning, and manual-open instructions. Such an artifact is ad-hoc signed, has not been screened by Apple's notary service, and must never be described as Apple-verified or production-ready. A checksum detects a mismatched download but does not establish publisher identity or software safety; never bypass a warning that says the app will damage the Mac or contains malware.
 
 Windows packages are explicitly labeled Beta until Authenticode signing and Windows 10/11 compatibility verification are complete. Verify the published SHA-256 checksum before running an unsigned Beta and expect Microsoft Defender SmartScreen to identify an unknown publisher.
 
