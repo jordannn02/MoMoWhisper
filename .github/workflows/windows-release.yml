@@ -50,7 +50,7 @@ jobs:
         id: package_version
         shell: pwsh
         run: |
-          $version = "0.1.0-beta.${{ github.run_number }}"
+          $version = "0.2.0-beta.${{ github.run_number }}"
           if ($env:GITHUB_REF -like "refs/tags/v*") {
             $version = $env:GITHUB_REF_NAME.Substring(1)
           }

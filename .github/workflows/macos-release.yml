@@ -38,6 +38,11 @@ jobs:
           TMPDIR: /tmp
         run: swift test -j 4
 
+      - name: Run Summary V2 production smoke tests
+        env:
+          TMPDIR: /tmp
+        run: bash scripts/run-summary-v2-smoke-tests.sh
+
       - name: Run lifecycle regression runner
         env:
           TMPDIR: /tmp
@@ -49,9 +54,10 @@ jobs:
           MOMO_WHISPER_BUILD_NUMBER: ${{ github.run_number }}
           REQUEST_UNIVERSAL: ${{ inputs.universal || 'false' }}
         run: |
-          version="0.1.0"
+          version="0.2.0"
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            version="${GITHUB_REF_NAME#v}"
+            release_version="${GITHUB_REF_NAME#v}"
+            version="${release_version%%-*}"
             REQUEST_UNIVERSAL="true"
           fi
 

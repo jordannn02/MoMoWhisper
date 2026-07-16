@@ -5,13 +5,20 @@ import Darwin
 import Foundation
 import Speech
 import MoMoWhisperSessionCore
+import MoMoWhisperSummaryCore
 
 @MainActor
 final class SpeechTranscriptionService: ObservableObject {
     @Published var transcript = ""
     @Published var partialTranscript = ""
     @Published var meetingNotes = ""
+    @Published private(set) var rawMeetingNotes = ""
+    @Published private(set) var summaryDocument = MeetingSummaryDocument.empty(
+        id: "unsaved-meeting",
+        title: "未命名會議"
+    )
     @Published var isRecording = false
+    @Published private(set) var isSessionTransitionInProgress = false
     @Published var statusText = "待開始"
     @Published var summaryStatusText = "待整理"
     @Published var lastError: String?
@@ -118,6 +125,9 @@ final class SpeechTranscriptionService: ObservableObject {
     }
     @Published var currentSessionMetadata: MeetingSessionMetadata?
     @Published var meetingHistory: [MeetingSessionMetadata] = []
+    @Published private(set) var latestValidCodexHandoffExists = false
+    @Published private(set) var latestValidCodexHandoffReady = false
+    @Published private(set) var deliveryArtifactChecks: [DeliveryArtifactCheck] = []
     @Published var meetingHistorySearchText = "" {
         didSet {
             refreshMeetingHistory()
@@ -128,12 +138,17 @@ final class SpeechTranscriptionService: ObservableObject {
     private let audioRouter = SpeechAudioBufferRouter()
     private let microphoneLevelMeter = SpeechAudioLevelMeter()
     private let systemAudioCapture = SystemAudioCapture()
-    private let meetingSessionStore = MeetingSessionStore()
+    private let meetingSessionStore: MeetingSessionStore
+    private let meetingPersistenceCoordinator: LatestWinsPersistenceCoordinator<
+        MeetingPersistenceRequest,
+        MeetingPersistenceResult
+    >
     private let meetingAudioRecorder = MeetingAudioRecorder()
 
     private var speechRecognizer: SFSpeechRecognizer? = SFSpeechRecognizer(locale: Locale(identifier: "zh-TW"))
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
+    private var recognitionGeneration: UInt64 = 0
     private var speechAnalyzerSession: SpeechAnalyzerSessionHandling?
     private var systemSpeechAnalyzerSession: SpeechAnalyzerSessionHandling?
     private var microphoneAudioProcessor: AudioInputProcessor?
@@ -141,6 +156,7 @@ final class SpeechTranscriptionService: ObservableObject {
     private var summaryTask: Task<Void, Never>?
     private var summaryRequestTask: Task<Void, Never>?
     private var postRecordingSummaryTask: Task<Void, Never>?
+    private var manualTranscriptEditTask: Task<Void, Never>?
     private var latestRecognitionText = ""
     private var latestFullRecognitionText = ""
     private var committedRecognitionText = ""
@@ -167,11 +183,30 @@ final class SpeechTranscriptionService: ObservableObject {
     private var lastSummaryUpdatedAt: Date?
     private var lastAutomaticSummaryAt: Date?
     private var lastSummarizedTranscriptCharacterCount = 0
+    private var lastSummarizedTranscriptPrefix = ""
+    private var accumulatedAISummaryUnits = 0
+    private var accumulatedFallbackSummaryUnits = 0
+    private var pendingSummaryRetries: [PendingSummaryRetry] = []
+    private var meetingHistoryCache = MeetingSessionHistoryCache()
+    private var currentSessionCommit: MeetingSessionCommit?
+    private var persistenceEpoch: UInt64 = 1
+    private var persistenceRevision: UInt64 = 0
+    private var isTerminationQuiescing = false
+    private var activeSessionOperationID: UUID?
+    private var latestPersistenceRevisionBySession: [UUID: UInt64] = [:]
+    private var lastArtifactTrustCacheRefreshAt = Date.distantPast
+    private var manualTranscriptEditInvalidatedSummary = false
     private var currentRecordingURL: URL?
     private var recordingLifecycle = MeetingRecordingLifecycle()
     private var isLoadingSummarySettings = false
 
     init() {
+        let rootDirectory = MeetingSessionStore.defaultRootDirectory
+        meetingSessionStore = MeetingSessionStore(rootDirectory: rootDirectory)
+        let persistenceBackend = MeetingPersistenceBackend(rootDirectory: rootDirectory)
+        meetingPersistenceCoordinator = LatestWinsPersistenceCoordinator { token, request in
+            try persistenceBackend.persist(token: token, request: request)
+        }
         loadSummarySettings()
         refreshInputDevices()
         refreshMeetingHistory()
@@ -186,21 +221,36 @@ final class SpeechTranscriptionService: ObservableObject {
     private static let recentTranscriptCharacterLimit = 8_000
     private static let postRecordingSummaryInitialDelayNanoseconds: UInt64 = 3_000_000_000
     private static let postRecordingSummaryDrainIntervalNanoseconds: UInt64 = 20_000_000_000
+    private static let maximumBackgroundSummaryRetryAttempts = 3
+    private static let fallbackScopeID = "summary-local-fallback"
+    private static let fallbackTopicID = "summary-local-fallback-topic"
     private static let deliveryTranscriptMinimumCharacters = 300
     private static let deliveryHighlightsMinimumCharacters = 80
     private static let deliveryRecordingMinimumBytes = 45
 
     private struct SummaryRequestPlan {
+        var id: String
         var payloadTranscript: String
         var recentTranscript: String
+        var rangeStart: Int
+        var rangeEnd: Int
         var summarizedCharacterCount: Int
         var requestIsFinal: Bool
         var continuation: SummaryContinuation
+        var retryID: String?
+        var retryRecord: MeetingSummaryRetryRecord?
+        var sourcePrefixFingerprint: String
+
+        var unitCount: Int {
+            max(0, rangeEnd - rangeStart)
+        }
 
         var fallbackTranscript: String {
             payloadTranscript.isEmpty ? recentTranscript : payloadTranscript
         }
     }
+
+    private typealias PendingSummaryRetry = MeetingSummaryRetryRecord
 
     private enum SummaryContinuation {
         case none
@@ -400,6 +450,20 @@ final class SpeechTranscriptionService: ObservableObject {
         !meetingNotesOutput().isEmpty
     }
 
+    var isViewingHistoricalSession: Bool {
+        if case .loadedHistory = recordingLifecycle.state {
+            return true
+        }
+        return false
+    }
+
+    var isSummaryRequestActive: Bool {
+        isSummaryRequestInFlight
+            || shouldRunSummaryAfterCurrentRequest
+            || shouldRunFinalSummaryAfterCurrentRequest
+            || postRecordingSummaryTask != nil
+    }
+
     var transcriptCharacterCount: Int {
         visibleTranscriptOutput().count
     }
@@ -409,7 +473,7 @@ final class SpeechTranscriptionService: ObservableObject {
     }
 
     var summarizedTranscriptCount: Int {
-        min(max(0, lastSummarizedTranscriptCharacterCount), transcriptCharacterCount)
+        min(max(0, summaryDocument.processing.processedUnits), transcriptCharacterCount)
     }
 
     var unsummarizedTranscriptCount: Int {
@@ -423,10 +487,29 @@ final class SpeechTranscriptionService: ObservableObject {
         return min(1, Double(summarizedTranscriptCount) / Double(transcriptCharacterCount))
     }
 
+    var summaryAICharacterCount: Int {
+        min(summaryDocument.processing.aiUnits, transcriptCharacterCount)
+    }
+
+    var summaryFallbackCoverageCharacterCount: Int {
+        min(summaryDocument.processing.fallbackUnits, transcriptCharacterCount)
+    }
+
+    var summaryPendingCharacterCount: Int {
+        max(0, transcriptCharacterCount - summarizedTranscriptCount)
+    }
+
     var latestValidMeetingMetadata: MeetingSessionMetadata? {
         meetingHistory.first { metadata in
-            metadata.isMeaningfulForHandoff
+            isMeetingMeaningfulForHandoff(metadata)
         }
+    }
+
+    func isMeetingMeaningfulForHandoff(_ metadata: MeetingSessionMetadata) -> Bool {
+        if currentSessionMetadata?.id == metadata.id {
+            return metadata.isMeaningfulForHandoff(summaryDocument: summaryDocument)
+        }
+        return meetingHistoryCache.isMeaningfulForHandoff(metadata)
     }
 
     var latestValidCodexHandoffJSONPath: String {
@@ -435,11 +518,7 @@ final class SpeechTranscriptionService: ObservableObject {
             .path
     }
 
-    var latestValidCodexHandoffExists: Bool {
-        FileManager.default.fileExists(atPath: latestValidCodexHandoffJSONPath)
-    }
-
-    var latestValidCodexHandoffReady: Bool {
+    private func inspectLatestValidCodexHandoffReadiness() -> Bool {
         let handoffCheck = DeliveryArtifactInspector.inspectTextFile(
             label: "latest_valid handoff",
             path: latestValidCodexHandoffJSONPath,
@@ -449,26 +528,26 @@ final class SpeechTranscriptionService: ObservableObject {
               let expectedMeetingID = latestValidMeetingMetadata?.id.uuidString,
               let data = FileManager.default.contents(atPath: latestValidCodexHandoffJSONPath),
               let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              payload["meetingID"] as? String == expectedMeetingID else {
+              (payload["schemaVersion"] as? NSNumber)?.intValue == 2,
+              payload["meetingID"] as? String == expectedMeetingID,
+              payload["compatibilityPathsTrusted"] as? Bool == false,
+              let transactionID = payload["sessionTransactionID"] as? String,
+              let sessionStatePath = payload["sessionStatePath"] as? String,
+              let meetingID = UUID(uuidString: expectedMeetingID),
+              let commit = try? meetingSessionStore.readVerifiedCommit(
+                  at: URL(fileURLWithPath: sessionStatePath),
+                  expectedTransactionID: transactionID,
+                  expectedMeetingID: meetingID
+              ) else {
             return false
         }
-
-        let transcriptPath = payload["transcriptPath"] as? String ?? ""
-        let highlightsPath = payload["highlightsPath"] as? String ?? ""
-        let transcriptCheck = DeliveryArtifactInspector.inspectTextFile(
-            label: "逐字稿",
-            path: transcriptPath,
-            minimumCharacters: Self.deliveryTranscriptMinimumCharacters
+        return MeetingSummaryHandoffValidity.isValid(
+            transcriptCharacterCount: commit.snapshot.metadata.transcriptCharacterCount,
+            summaryDocument: commit.snapshot.summaryDocument
         )
-        let highlightsCheck = DeliveryArtifactInspector.inspectTextFile(
-            label: "會議重點",
-            path: highlightsPath,
-            minimumCharacters: Self.deliveryHighlightsMinimumCharacters
-        )
-        return transcriptCheck.meetsRequirement || highlightsCheck.meetsRequirement
     }
 
-    var deliveryArtifactChecks: [DeliveryArtifactCheck] {
+    private func inspectDeliveryArtifacts() -> [DeliveryArtifactCheck] {
         guard let metadata = currentSessionMetadata else {
             return [
                 DeliveryArtifactInspector.inspectTextFile(
@@ -490,27 +569,31 @@ final class SpeechTranscriptionService: ObservableObject {
             ]
         }
 
-        let sessionFolder = meetingSessionStore.sessionFolderURL(for: metadata)
+        let committedSnapshot = currentSessionCommit?.snapshot
+        let authoritativePath = currentSessionCommit?.authoritativeStateURL.path
+            ?? meetingSessionStore.authoritativeStateURL(for: metadata).path
         var checks = [
-            DeliveryArtifactInspector.inspectTextFile(
+            DeliveryArtifactInspector.inspectTextContent(
                 label: "逐字稿",
-                path: sessionFolder.appendingPathComponent("transcript.md").path,
+                text: committedSnapshot?.transcriptMarkdown ?? "",
+                sourcePath: "\(authoritativePath)#/snapshot/transcriptMarkdown",
                 minimumCharacters: Self.deliveryTranscriptMinimumCharacters
             ),
-            DeliveryArtifactInspector.inspectTextFile(
+            DeliveryArtifactInspector.inspectTextContent(
                 label: "會議重點",
-                path: metadata.exportedHighlightsFilePath
-                    ?? sessionFolder.appendingPathComponent("highlights.md").path,
+                text: committedSnapshot?.highlightsMarkdown ?? "",
+                sourcePath: "\(authoritativePath)#/snapshot/highlightsMarkdown",
                 minimumCharacters: Self.deliveryHighlightsMinimumCharacters
             )
         ]
 
-        let recordingParts = metadata.recordingParts.sorted { $0.sequence < $1.sequence }
+        let committedMetadata = committedSnapshot?.metadata ?? metadata
+        let recordingParts = committedMetadata.recordingParts.sorted { $0.sequence < $1.sequence }
         if recordingParts.isEmpty {
             checks.append(
                 DeliveryArtifactInspector.inspectBinaryFile(
                     label: "錄音 part",
-                    path: metadata.recordingFilePath ?? "",
+                    path: committedMetadata.recordingFilePath ?? "",
                     minimumBytes: Self.deliveryRecordingMinimumBytes
                 )
             )
@@ -527,11 +610,27 @@ final class SpeechTranscriptionService: ObservableObject {
         checks.append(
             DeliveryArtifactInspector.inspectTextFile(
                 label: "Codex handoff",
-                path: metadata.codexHandoffFilePath ?? "",
+                path: committedMetadata.codexHandoffFilePath ?? "",
                 minimumCharacters: 1
             )
         )
         return checks
+    }
+
+    /// Refresh filesystem-backed trust evidence outside SwiftUI view
+    /// evaluation. Views render only these published values and therefore never
+    /// decode session snapshots or artifact files while evaluating `body`.
+    private func refreshArtifactTrustCache(force: Bool = false) {
+        let now = Date()
+        guard force || now.timeIntervalSince(lastArtifactTrustCacheRefreshAt) >= 5 else {
+            return
+        }
+        lastArtifactTrustCacheRefreshAt = now
+        latestValidCodexHandoffExists = FileManager.default.fileExists(
+            atPath: latestValidCodexHandoffJSONPath
+        )
+        latestValidCodexHandoffReady = inspectLatestValidCodexHandoffReadiness()
+        deliveryArtifactChecks = inspectDeliveryArtifacts()
     }
 
     var vocabularyCount: Int {
@@ -659,7 +758,29 @@ final class SpeechTranscriptionService: ObservableObject {
         preflightLastCheckedAt = nil
     }
 
+    private func beginSessionOperation() -> UUID? {
+        guard activeSessionOperationID == nil else {
+            lastError = "錄音或會議狀態正在切換，請稍候再試。"
+            return nil
+        }
+        let operationID = UUID()
+        activeSessionOperationID = operationID
+        isSessionTransitionInProgress = true
+        return operationID
+    }
+
+    private func endSessionOperation(_ operationID: UUID) {
+        guard activeSessionOperationID == operationID else { return }
+        activeSessionOperationID = nil
+        isSessionTransitionInProgress = false
+    }
+
+    private func isCurrentSessionOperation(_ operationID: UUID) -> Bool {
+        activeSessionOperationID == operationID
+    }
+
     func toggleRecording() async {
+        guard !isTerminationQuiescing else { return }
         switch recordingLifecycle.state {
         case .recording:
             await stopRecording()
@@ -675,19 +796,30 @@ final class SpeechTranscriptionService: ObservableObject {
     }
 
     func startNextMeeting() async {
+        guard !isTerminationQuiescing else { return }
+        guard let operationID = beginSessionOperation() else { return }
+        defer { endSessionOperation(operationID) }
         lastError = nil
+        cancelSummaryWorkForSessionBoundary()
 
         if isRecording {
-            await stopRecording(runFinalSummary: false)
-        } else {
-            autosaveCurrentSession(endedAt: Date())
+            guard await stopRecording(
+                operationID: operationID,
+                runFinalSummary: false
+            ) else {
+                statusText = "切換前保存失敗"
+                return
+            }
+        } else if !isViewingHistoricalSession {
+            if let saveTask = autosaveCurrentSession(
+                endedAt: Date(),
+                debounceNanoseconds: 0
+            ), !(await saveTask.value) {
+                return
+            }
         }
 
         cancelSummaryWorkForSessionBoundary()
-
-        if hasContent {
-            exportFinalArtifactsIfPossible()
-        }
 
         resetLiveMeetingStateForNextMeeting()
         startNewMeetingSession()
@@ -849,6 +981,14 @@ final class SpeechTranscriptionService: ObservableObject {
     }
 
     func startRecording() async {
+        guard !isTerminationQuiescing else { return }
+        guard let operationID = beginSessionOperation() else { return }
+        defer { endSessionOperation(operationID) }
+        await startRecording(operationID: operationID)
+    }
+
+    private func startRecording(operationID: UUID) async {
+        guard isCurrentSessionOperation(operationID), !isTerminationQuiescing else { return }
         lastError = nil
         stopPostRecordingSummaryDrain()
 
@@ -873,6 +1013,22 @@ final class SpeechTranscriptionService: ObservableObject {
             return
         case .createNewSession:
             cancelSummaryWorkForSessionBoundary()
+            if !isViewingHistoricalSession, currentSessionMetadata != nil {
+                let boundaryTask = hasContent
+                    ? exportFinalArtifactsIfPossible()
+                    : autosaveCurrentSession(debounceNanoseconds: 0)
+                if let boundaryTask, !(await boundaryTask.value) {
+                    recordingLifecycle.failStart()
+                    statusText = "建立新會議前保存失敗"
+                    return
+                }
+            }
+            guard isCurrentSessionOperation(operationID),
+                  case .startingNewSession = recordingLifecycle.state else {
+                _ = await abortStartingRecording()
+                return
+            }
+            cancelSummaryWorkForSessionBoundary()
             resetLiveMeetingStateForNextMeeting()
             guard recordingLifecycle.requestStart() == .createNewSession else {
                 lastError = "無法建立新的錄音 session。"
@@ -890,13 +1046,14 @@ final class SpeechTranscriptionService: ObservableObject {
         }
 
         guard await requestPermissions(needsMicrophone: audioCaptureMode.usesMicrophone) else {
-            failStartingRecording()
+            _ = await failStartingRecording()
             statusText = "權限未開"
             return
         }
 
-        guard recordingLifecycle.isStartStillActive else {
-            abortStartingRecording()
+        guard isCurrentSessionOperation(operationID),
+              recordingLifecycle.isStartStillActive else {
+            _ = await abortStartingRecording()
             return
         }
 
@@ -904,7 +1061,7 @@ final class SpeechTranscriptionService: ObservableObject {
             guard #available(macOS 26.0, *) else {
                 statusText = "語音服務不可用"
                 lastError = "SpeechAnalyzer 需要 macOS 26 或更新版本。"
-                failStartingRecording()
+                _ = await failStartingRecording()
                 return
             }
 
@@ -917,16 +1074,23 @@ final class SpeechTranscriptionService: ObservableObject {
             statusText = "SpeechAnalyzer 啟動失敗"
             lastError = error.localizedDescription
             cancelSpeechAnalyzerSession()
-            failStartingRecording()
+            _ = await failStartingRecording()
             return
         }
         } else {
             guard let speechRecognizer, speechRecognizer.isAvailable else {
                 statusText = "語音服務不可用"
                 lastError = "目前語音辨識服務不可用，請稍後再試或切換語言。"
-                failStartingRecording()
+                _ = await failStartingRecording()
                 return
             }
+        }
+
+        guard isCurrentSessionOperation(operationID),
+              recordingLifecycle.isStartStillActive else {
+            cancelSpeechAnalyzerSession()
+            _ = await abortStartingRecording()
+            return
         }
 
         stopRecognitionOnly()
@@ -952,7 +1116,7 @@ final class SpeechTranscriptionService: ObservableObject {
         guard prepareRecordingArtifactForCurrentSession() else {
             statusText = "輸出未就緒"
             cancelSpeechAnalyzerSession()
-            failStartingRecording()
+            _ = await failStartingRecording()
             return
         }
 
@@ -964,7 +1128,7 @@ final class SpeechTranscriptionService: ObservableObject {
                 statusText = "啟動失敗"
                 lastError = error.localizedDescription
                 cancelSpeechAnalyzerSession()
-                failStartingRecording()
+                _ = await failStartingRecording()
                 return
             }
 
@@ -997,7 +1161,7 @@ final class SpeechTranscriptionService: ObservableObject {
                 statusText = "啟動失敗"
                 lastError = error.localizedDescription
                 cancelSpeechAnalyzerSession()
-                failStartingRecording()
+                _ = await failStartingRecording()
                 return
             }
         } else {
@@ -1017,12 +1181,14 @@ final class SpeechTranscriptionService: ObservableObject {
             speechRecognitionStatusText = "辨識未啟動"
             stopRecognitionOnly()
             cancelSpeechAnalyzerSession()
-            failStartingRecording()
+            _ = await failStartingRecording()
             return
         }
 
-        guard recordingLifecycle.isStartStillActive, recordingLifecycle.markRecordingStarted() else {
-            abortStartingRecording()
+        guard isCurrentSessionOperation(operationID),
+              recordingLifecycle.isStartStillActive,
+              recordingLifecycle.markRecordingStarted() else {
+            _ = await abortStartingRecording()
             return
         }
 
@@ -1035,15 +1201,28 @@ final class SpeechTranscriptionService: ObservableObject {
         exportLiveHandoffIfPossible()
     }
 
-    func stopRecording(runFinalSummary: Bool = true) async {
+    @discardableResult
+    func stopRecording(runFinalSummary: Bool = true) async -> Bool {
+        guard let operationID = beginSessionOperation() else { return false }
+        defer { endSessionOperation(operationID) }
+        return await stopRecording(
+            operationID: operationID,
+            runFinalSummary: runFinalSummary
+        )
+    }
+
+    private func stopRecording(
+        operationID: UUID,
+        runFinalSummary: Bool
+    ) async -> Bool {
+        guard isCurrentSessionOperation(operationID) else { return false }
         switch recordingLifecycle.requestStop() {
         case .stopActiveRecording:
             break
         case .abortStarting:
-            abortStartingRecording()
-            return
+            return await abortStartingRecording()
         case .ignored:
-            return
+            return true
         }
 
         let shouldFinishSpeechAnalyzer = usesSpeechAnalyzerRecognition
@@ -1076,28 +1255,64 @@ final class SpeechTranscriptionService: ObservableObject {
         stopLiveSummaryLoop()
         statusText = "已停止"
         isRecording = false
-        autosaveCurrentSession(endedAt: Date())
+        cancelSummaryWorkForSessionBoundary()
+        guard let saveTask = autosaveCurrentSession(
+            endedAt: Date(),
+            debounceNanoseconds: 0
+        ) else {
+            recordingLifecycle.finishStop()
+            lastError = "停止錄音後無法建立保存工作。"
+            return false
+        }
+        guard await saveTask.value else {
+            recordingLifecycle.finishStop()
+            return false
+        }
         recordingLifecycle.finishStop()
 
         guard runFinalSummary else {
-            exportFinalArtifactsIfPossible()
-            return
+            return true
         }
 
         if runMeetingSummary(isFinal: true, force: true) {
             startPostRecordingSummaryDrain()
-        } else {
-            exportFinalArtifactsIfPossible()
         }
+        return true
     }
 
-    func clear() {
-        autosaveCurrentSession(endedAt: Date())
+    func clear() async {
+        guard !isTerminationQuiescing else { return }
+        guard let operationID = beginSessionOperation() else { return }
+        defer { endSessionOperation(operationID) }
+        guard !isRecording else {
+            lastError = "錄音中不可清空；請先停止錄音，確認保存完成後再清空。"
+            return
+        }
+        switch recordingLifecycle.state {
+        case .startingNewSession, .startingRecordingPart, .stopping:
+            lastError = "錄音狀態切換中，暫時不可清空。"
+            return
+        case .idle, .ready, .recording, .ended, .loadedHistory:
+            break
+        }
+        cancelSummaryWorkForSessionBoundary()
+        if !isViewingHistoricalSession {
+            if let saveTask = autosaveCurrentSession(
+                endedAt: Date(),
+                debounceNanoseconds: 0
+            ), !(await saveTask.value) {
+                return
+            }
+        }
+        persistenceEpoch &+= 1
+        currentSessionCommit = nil
         recordingLifecycle.reset()
         currentRecordingURL = nil
         transcript = ""
         partialTranscript = ""
         meetingNotes = ""
+        rawMeetingNotes = ""
+        summaryDocument = .empty(id: "unsaved-meeting", title: "未命名會議")
         currentSessionMetadata = nil
         currentSessionStartedAt = nil
         transcriptSegments = []
@@ -1125,6 +1340,10 @@ final class SpeechTranscriptionService: ObservableObject {
         lastSummaryUpdatedAt = nil
         lastAutomaticSummaryAt = nil
         lastSummarizedTranscriptCharacterCount = 0
+        lastSummarizedTranscriptPrefix = ""
+        accumulatedAISummaryUnits = 0
+        accumulatedFallbackSummaryUnits = 0
+        pendingSummaryRetries = []
         deepSeekDiagnosticsText = "DeepSeek cache 待開始"
         summaryStatusText = "待整理"
     }
@@ -1135,6 +1354,9 @@ final class SpeechTranscriptionService: ObservableObject {
         summaryTask = nil
         summaryRequestTask?.cancel()
         summaryRequestTask = nil
+        manualTranscriptEditTask?.cancel()
+        manualTranscriptEditTask = nil
+        manualTranscriptEditInvalidatedSummary = false
         stopPostRecordingSummaryDrain()
         stopLiveSummaryLoop()
         isSummaryRequestInFlight = false
@@ -1147,6 +1369,8 @@ final class SpeechTranscriptionService: ObservableObject {
         transcript = ""
         partialTranscript = ""
         meetingNotes = ""
+        rawMeetingNotes = ""
+        summaryDocument = .empty(id: "unsaved-meeting", title: "未命名會議")
         currentSessionMetadata = nil
         currentSessionStartedAt = nil
         transcriptSegments = []
@@ -1173,18 +1397,105 @@ final class SpeechTranscriptionService: ObservableObject {
         lastSummaryUpdatedAt = nil
         lastAutomaticSummaryAt = nil
         lastSummarizedTranscriptCharacterCount = 0
+        lastSummarizedTranscriptPrefix = ""
+        accumulatedAISummaryUnits = 0
+        accumulatedFallbackSummaryUnits = 0
+        pendingSummaryRetries = []
         deepSeekDiagnosticsText = "DeepSeek cache 待開始"
     }
 
     func refreshMeetingNotes() {
+        guard !isTerminationQuiescing, activeSessionOperationID == nil else { return }
+        if pendingSummaryRetries.contains(where: { $0.attempts >= Self.maximumBackgroundSummaryRetryAttempts }) {
+            pendingSummaryRetries = pendingSummaryRetries.map { retry in
+                var rearmed = retry
+                rearmed.attempts = 0
+                return rearmed
+            }
+            summaryStatusText = "已重新啟用本機備援範圍，準備重試"
+            reconcileSummaryProcessing(totalUnits: summaryTranscriptOutput().count)
+        }
         runMeetingSummary(isFinal: true, force: true)
+    }
+
+    func updateSummaryItem(
+        id: String,
+        text: String,
+        status: MeetingSummaryItemStatus,
+        owner: String? = nil,
+        dueDate: String? = nil
+    ) {
+        guard !isTerminationQuiescing, activeSessionOperationID == nil else { return }
+        guard var item = summaryDocument.items.first(where: { $0.id == id }) else {
+            return
+        }
+        item.text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        item.status = status
+        item.owner = Self.nilIfBlank(owner)
+        item.dueDate = Self.nilIfBlank(dueDate)
+        item.source = .manual
+        item.lockedByUser = true
+        applyDocumentDelta(.init(
+            id: "manual-update-\(id)-\(UUID().uuidString)",
+            operations: [.upsertItem(item)]
+        ))
+        autosaveCurrentSession()
+    }
+
+    func setSummaryItemLocked(id: String, locked: Bool) {
+        guard !isTerminationQuiescing, activeSessionOperationID == nil else { return }
+        guard var item = summaryDocument.items.first(where: { $0.id == id }) else {
+            return
+        }
+        item.source = .manual
+        item.lockedByUser = locked
+        applyDocumentDelta(.init(
+            id: "manual-lock-\(id)-\(UUID().uuidString)",
+            operations: [.upsertItem(item)]
+        ))
+        autosaveCurrentSession()
+    }
+
+    func resolveSummaryItem(id: String) {
+        guard !isTerminationQuiescing, activeSessionOperationID == nil else { return }
+        guard var item = summaryDocument.items.first(where: { $0.id == id }) else {
+            return
+        }
+        item.status = .resolved
+        item.source = .manual
+        item.lockedByUser = true
+        applyDocumentDelta(.init(
+            id: "manual-resolve-\(id)-\(UUID().uuidString)",
+            operations: [.upsertItem(item)]
+        ))
+        autosaveCurrentSession()
+    }
+
+    func updateSummaryHeadline(_ headline: String) {
+        guard !isTerminationQuiescing, activeSessionOperationID == nil else { return }
+        applyDocumentDelta(.init(
+            id: "manual-headline-\(UUID().uuidString)",
+            operations: [.setManualHeadline(headline)]
+        ))
+        autosaveCurrentSession()
     }
 
     func startNewMeetingSession(title: String? = nil) {
         do {
+            persistenceEpoch &+= 1
+            currentSessionCommit = nil
             let metadata = try meetingSessionStore.createSession(title: title)
             currentSessionMetadata = metadata
             currentSessionStartedAt = metadata.startedAt
+            summaryDocument = .empty(id: metadata.id.uuidString, title: metadata.displayTitle)
+            liveSummaryState = .empty
+            meetingNotes = ""
+            rawMeetingNotes = ""
+            lastSummarizedTranscriptCharacterCount = 0
+            lastSummarizedTranscriptPrefix = ""
+            accumulatedAISummaryUnits = 0
+            accumulatedFallbackSummaryUnits = 0
+            pendingSummaryRetries = []
             currentRecordingURL = nil
             if case .startingNewSession = recordingLifecycle.state {
                 // startRecording() attaches this freshly allocated session before creating a part.
@@ -1194,6 +1505,7 @@ final class SpeechTranscriptionService: ObservableObject {
             transcriptSegments = []
             refreshMeetingHistory()
             autosaveCurrentSession()
+            refreshArtifactTrustCache(force: true)
         } catch {
             lastError = "建立會議歷史失敗：\(error.localizedDescription)"
         }
@@ -1201,33 +1513,95 @@ final class SpeechTranscriptionService: ObservableObject {
 
     func refreshMeetingHistory() {
         do {
-            meetingHistory = try meetingSessionStore.searchMetadata(query: meetingHistorySearchText)
+            let records = try meetingSessionStore.searchHistoryRecords(query: meetingHistorySearchText)
+            meetingHistoryCache.replace(with: records)
+            meetingHistory = records.map(\.metadata)
+            refreshArtifactTrustCache()
         } catch {
+            meetingHistoryCache.replace(with: [])
             meetingHistory = []
+            refreshArtifactTrustCache()
             lastError = "讀取會議歷史失敗：\(error.localizedDescription)"
         }
     }
 
-    func loadMeetingSession(_ metadata: MeetingSessionMetadata) {
+    /// Autosave already has the committed record in memory, so update the
+    /// visible history and badge cache directly instead of rescanning every
+    /// meeting folder after each recognized utterance.
+    private func upsertCommittedHistoryRecord(_ record: MeetingSessionHistoryRecord) {
+        meetingHistory.removeAll { $0.id == record.metadata.id }
+        if historyRecordMatchesCurrentSearch(record) {
+            meetingHistory.append(record.metadata)
+            meetingHistory.sort { $0.updatedAt > $1.updatedAt }
+            meetingHistoryCache.upsert(record)
+        } else {
+            meetingHistoryCache.remove(id: record.metadata.id)
+        }
+    }
+
+    private func historyRecordMatchesCurrentSearch(_ record: MeetingSessionHistoryRecord) -> Bool {
+        let keywords = meetingHistorySearchText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .split(whereSeparator: { $0.isWhitespace })
+            .map(String.init)
+        guard !keywords.isEmpty else {
+            return true
+        }
+
+        let metadata = record.metadata
+        let haystack = [
+            metadata.title,
+            metadata.folderName,
+            metadata.summaryProvider,
+            metadata.transcriptionEngine,
+            metadata.audioCaptureMode,
+            MeetingSessionStore.displayDateFormatter.string(from: metadata.startedAt)
+        ]
+        .joined(separator: " ")
+        .lowercased()
+        return keywords.allSatisfy { haystack.contains($0) }
+    }
+
+    func loadMeetingSession(_ metadata: MeetingSessionMetadata) async {
+        guard !isTerminationQuiescing else { return }
+        guard let operationID = beginSessionOperation() else { return }
+        defer { endSessionOperation(operationID) }
         guard !isRecording else {
             lastError = "錄音中不可載入歷史會議。"
             return
         }
 
         cancelSummaryWorkForSessionBoundary()
+        if !isViewingHistoricalSession,
+           let saveTask = autosaveCurrentSession(
+               endedAt: currentSessionMetadata?.endedAt,
+               debounceNanoseconds: 0
+           ), !(await saveTask.value) {
+            return
+        }
 
         do {
-            let snapshot = try meetingSessionStore.loadSnapshot(metadata: metadata)
+            persistenceEpoch &+= 1
+            let committedSession = try? meetingSessionStore.loadCommit(metadata: metadata)
+            let snapshot = try committedSession?.snapshot
+                ?? meetingSessionStore.loadSnapshot(metadata: metadata)
+            currentSessionCommit = committedSession
             currentSessionMetadata = snapshot.metadata
             currentSessionStartedAt = snapshot.metadata.startedAt
             recordingLifecycle.markHistoryLoaded(snapshot.metadata.id)
             currentRecordingURL = nil
             lastRecordingFilePath = snapshot.metadata.recordingFilePath ?? ""
             transcriptSegments = snapshot.transcriptSegments
-            transcript = snapshot.transcriptMarkdown
+            transcript = snapshot.summarySourceTranscript
             partialTranscript = ""
+            rawMeetingNotes = snapshot.highlightsMarkdown
             meetingNotes = snapshot.highlightsMarkdown
             liveSummaryState = snapshot.rawSummaryState
+            summaryDocument = snapshot.summaryDocument
+            if !summaryDocument.items.isEmpty || !summaryDocument.headline.isEmpty {
+                meetingNotes = MeetingSummaryRenderer.render(summaryDocument)
+            }
             latestRecognitionText = ""
             latestFullRecognitionText = ""
             committedRecognitionText = ""
@@ -1235,15 +1609,33 @@ final class SpeechTranscriptionService: ObservableObject {
             resetCommittedTranscriptTracking()
             lastUpdatedAt = snapshot.metadata.updatedAt
             lastSummaryUpdatedAt = snapshot.metadata.updatedAt
-            lastSummarizedTranscriptCharacterCount = transcript.count
+            lastSummarizedTranscriptCharacterCount = min(
+                transcript.count,
+                summaryDocument.processing.processedUnits
+            )
+            lastSummarizedTranscriptPrefix = String(
+                summaryTranscriptOutput().prefix(lastSummarizedTranscriptCharacterCount)
+            )
+            accumulatedAISummaryUnits = summaryDocument.processing.aiUnits
+            accumulatedFallbackSummaryUnits = summaryDocument.processing.fallbackUnits
+            // Exact retry ranges are persisted separately. Loading remains read-only:
+            // no retry is executed until the user explicitly resumes or starts work.
+            pendingSummaryRetries = snapshot.summaryRetries
             statusText = "已載入歷史"
             summaryStatusText = "已載入重點"
+            if !snapshot.quarantinedSummaryRetries.isEmpty {
+                lastError = "已隔離 \(snapshot.quarantinedSummaryRetries.count) 筆失效的摘要重試；不會送往 AI 服務。"
+            }
+            refreshArtifactTrustCache(force: true)
         } catch {
             lastError = "載入歷史會議失敗：\(error.localizedDescription)"
         }
     }
 
     func resumeCurrentMeetingSession() async {
+        guard !isTerminationQuiescing else { return }
+        guard let operationID = beginSessionOperation() else { return }
+        defer { endSessionOperation(operationID) }
         guard case let .startRecordingPart(sessionID) = recordingLifecycle.requestExplicitResume() else {
             lastError = "只有已結束或已載入的會議可以明確續錄。"
             return
@@ -1261,7 +1653,7 @@ final class SpeechTranscriptionService: ObservableObject {
         // startRecording() owns the writer setup. Restoring ready here makes this an
         // explicit resume that creates a new part rather than reopening an old WAV.
         recordingLifecycle.prepareNewSession(sessionID)
-        await startRecording()
+        await startRecording(operationID: operationID)
     }
 
     func openMeetingSessionFolder(_ metadata: MeetingSessionMetadata) {
@@ -1446,7 +1838,8 @@ final class SpeechTranscriptionService: ObservableObject {
         }
     }
 
-    private func failStartingRecording() {
+    private func failStartingRecording() async -> Bool {
+        let endedAt = Date()
         stopRecognitionOnly()
         systemAudioCapture.stop()
         audioEngine.inputNode.removeTap(onBus: 0)
@@ -1458,21 +1851,34 @@ final class SpeechTranscriptionService: ObservableObject {
             _ = meetingAudioRecorder.stop()
             if var metadata = currentSessionMetadata {
                 if let index = metadata.recordingParts.lastIndex(where: { $0.filePath == recordingURL.path }) {
-                    metadata.recordingParts[index].endedAt = Date()
+                    metadata.recordingParts[index].endedAt = endedAt
                     metadata.recordingParts[index].readiness = .failed
                 }
                 metadata.recordingReadiness = .failed
                 metadata.recordingReadinessDetail = metadata.recordingReadiness.verificationBoundary
+                metadata.endedAt = endedAt
+                metadata.updatedAt = endedAt
                 currentSessionMetadata = metadata
             }
+        } else if var metadata = currentSessionMetadata {
+            metadata.endedAt = endedAt
+            metadata.updatedAt = endedAt
+            currentSessionMetadata = metadata
         }
 
         isRecording = false
         recordingLifecycle.failStart()
-        autosaveCurrentSession(endedAt: Date())
+        guard let saveTask = autosaveCurrentSession(
+            endedAt: endedAt,
+            debounceNanoseconds: 0
+        ) else {
+            return currentSessionMetadata == nil
+        }
+        return await saveTask.value
     }
 
-    private func abortStartingRecording() {
+    private func abortStartingRecording() async -> Bool {
+        let endedAt = Date()
         stopRecognitionOnly()
         systemAudioCapture.stop()
         audioEngine.inputNode.removeTap(onBus: 0)
@@ -1484,91 +1890,84 @@ final class SpeechTranscriptionService: ObservableObject {
             finishRecordingArtifact()
         }
 
+        if var metadata = currentSessionMetadata {
+            metadata.endedAt = endedAt
+            metadata.updatedAt = endedAt
+            currentSessionMetadata = metadata
+        }
+
         isRecording = false
         recordingLifecycle.finishStop()
-        autosaveCurrentSession(endedAt: Date())
         statusText = "已停止"
+        guard let saveTask = autosaveCurrentSession(
+            endedAt: endedAt,
+            debounceNanoseconds: 0
+        ) else {
+            return currentSessionMetadata == nil
+        }
+        return await saveTask.value
     }
 
     private func exportLiveHandoffIfPossible() {
-        guard codexHandoffEnabled, let metadata = currentSessionMetadata else {
-            return
-        }
-
-        let transcriptMarkdown = visibleTranscriptOutput()
-        let highlightsMarkdown = meetingNotesOutput()
-        let hasMeetingContent = !transcriptMarkdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            || !highlightsMarkdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-
-        guard isRecording || hasMeetingContent else {
-            return
-        }
-
-        let sessionFolderPath = meetingSessionStore.sessionFolderURL(for: metadata).path
-        let recordingURL = currentRecordingURL
-            ?? metadata.recordingFilePath.map { URL(fileURLWithPath: $0) }
-
-        do {
-            let result = try MeetingArtifactExporter.exportCurrentHandoff(
-                metadata: metadata,
-                transcriptMarkdown: transcriptMarkdown,
-                highlightsMarkdown: highlightsMarkdown,
-                recordingURL: recordingURL,
-                sessionFolderPath: sessionFolderPath,
-                codexHandoffDirectory: MeetingArtifactExporter.defaultCodexHandoffDirectory,
-                isRecording: isRecording,
-                dateFormatter: Self.dateFormatter
-            )
-
-            lastCodexHandoffPath = result.codexHandoffMarkdownURL?.path ?? ""
-            if isRecording {
-                artifactStatusText = "即時 handoff 已更新"
-            }
-        } catch {
-            lastError = "即時 handoff 更新失敗：\(error.localizedDescription)"
-        }
+        autosaveCurrentSession()
     }
 
-    private func exportFinalArtifactsIfPossible() {
-        guard var metadata = currentSessionMetadata else {
-            return
+    /// Called by AppDelegate before AppKit terminates the process. A zero-delay
+    /// revision supersedes any pending 250 ms autosave and waits until the
+    /// authoritative snapshot plus required final artifacts are durable.
+    func prepareForTermination() async -> Bool {
+        guard !isTerminationQuiescing else { return false }
+        isTerminationQuiescing = true
+        var completed = false
+        defer {
+            if !completed {
+                isTerminationQuiescing = false
+            }
         }
+        guard let operationID = beginSessionOperation() else { return false }
+        defer { endSessionOperation(operationID) }
+        cancelSummaryWorkForSessionBoundary()
 
-        let transcriptMarkdown = visibleTranscriptOutput()
-        let highlightsMarkdown = meetingNotesOutput()
-        let sessionFolderPath = meetingSessionStore.sessionFolderURL(for: metadata).path
-        let recordingURL = currentRecordingURL
-            ?? metadata.recordingFilePath.map { URL(fileURLWithPath: $0) }
-
-        do {
-            let result = try MeetingArtifactExporter.export(
-                metadata: metadata,
-                transcriptMarkdown: transcriptMarkdown,
-                highlightsMarkdown: highlightsMarkdown,
-                recordingURL: recordingURL,
-                sessionFolderPath: sessionFolderPath,
-                highlightsDirectory: URL(fileURLWithPath: highlightsOutputDirectoryPath, isDirectory: true),
-                codexHandoffDirectory: MeetingArtifactExporter.defaultCodexHandoffDirectory,
-                includeCodexHandoff: codexHandoffEnabled,
-                dateFormatter: Self.dateFormatter
+        switch recordingLifecycle.state {
+        case .recording, .startingNewSession, .startingRecordingPart:
+            completed = await stopRecording(
+                operationID: operationID,
+                runFinalSummary: false
             )
-
-            metadata.recordingFilePath = result.recordingURL?.path
-            metadata.exportedHighlightsFilePath = result.highlightsURL.path
-            metadata.codexHandoffFilePath = result.codexHandoffMarkdownURL?.path
-            currentSessionMetadata = metadata
-
-            lastRecordingFilePath = result.recordingURL?.path ?? ""
-            lastHighlightsFilePath = result.highlightsURL.path
-            lastCodexHandoffPath = result.codexHandoffMarkdownURL?.path ?? ""
-            artifactStatusText = codexHandoffEnabled
-                ? "已輸出錄音、重點與 Codex handoff"
-                : "已輸出錄音與會議重點"
-            autosaveCurrentSession(endedAt: metadata.endedAt)
-        } catch {
-            lastError = "會後輸出失敗：\(error.localizedDescription)"
-            artifactStatusText = "會後輸出失敗"
+            return completed
+        case .stopping:
+            lastError = "正在停止錄音，請稍後再結束 MoMoWhisper。"
+            return false
+        case .idle, .ready, .ended, .loadedHistory:
+            break
         }
+
+        guard !isViewingHistoricalSession,
+              currentSessionMetadata != nil,
+              hasContent || currentSessionMetadata?.recordingFilePath != nil else {
+            completed = true
+            return true
+        }
+
+        guard let saveTask = autosaveCurrentSession(
+            endedAt: currentSessionMetadata?.endedAt ?? Date(),
+            debounceNanoseconds: 0
+        ) else {
+            lastError = "結束前無法建立保存工作。"
+            return false
+        }
+        completed = await saveTask.value
+        return completed
+    }
+
+    @discardableResult
+    private func exportFinalArtifactsIfPossible() -> Task<Bool, Never>? {
+        artifactStatusText = "會後輸出中"
+        return autosaveCurrentSession(
+            endedAt: currentSessionMetadata?.endedAt,
+            finalExport: true,
+            debounceNanoseconds: 0
+        )
     }
 
     private func ensureActiveMeetingSession() {
@@ -1609,13 +2008,22 @@ final class SpeechTranscriptionService: ObservableObject {
         }
     }
 
-    private func autosaveCurrentSession(endedAt: Date? = nil) {
+    @discardableResult
+    private func autosaveCurrentSession(
+        endedAt: Date? = nil,
+        finalExport: Bool = false,
+        debounceNanoseconds: UInt64? = nil
+    ) -> Task<Bool, Never>? {
+        guard !isViewingHistoricalSession else {
+            return nil
+        }
         guard var metadata = currentSessionMetadata else {
-            return
+            return nil
         }
 
         let now = Date()
         let transcriptMarkdown = visibleTranscriptOutput()
+        reconcileSummaryProcessing(totalUnits: summaryTranscriptOutput().count)
         let highlightsMarkdown = meetingNotesOutput()
         metadata.updatedAt = now
         if let endedAt {
@@ -1627,22 +2035,141 @@ final class SpeechTranscriptionService: ObservableObject {
         metadata.transcriptionEngine = selectedTranscriptionEngine.displayName
         metadata.audioCaptureMode = audioCaptureMode.displayName
 
+        let highlightsDirectory = URL(
+            fileURLWithPath: highlightsOutputDirectoryPath,
+            isDirectory: true
+        )
+        let codexHandoffDirectory = MeetingArtifactExporter.defaultCodexHandoffDirectory
+        let shouldPublishFinalArtifacts = finalExport || metadata.endedAt != nil
+        if shouldPublishFinalArtifacts {
+            metadata.exportedHighlightsFilePath = MeetingArtifactExporter.plannedHighlightsURL(
+                metadata: metadata,
+                directory: highlightsDirectory
+            ).path
+            metadata.codexHandoffFilePath = codexHandoffEnabled
+                ? MeetingArtifactExporter.plannedHandoffMarkdownURL(
+                    baseName: MeetingArtifactExporter.latestHandoffBaseName,
+                    directory: codexHandoffDirectory
+                ).path
+                : nil
+        }
+
         let snapshot = MeetingSessionSnapshot(
             metadata: metadata,
             transcriptSegments: transcriptSegments,
             transcriptMarkdown: transcriptMarkdown,
+            summarySourceTranscript: summaryTranscriptOutput(),
             highlightsMarkdown: highlightsMarkdown,
-            rawSummaryState: liveSummaryState
+            rawSummaryState: liveSummaryState,
+            summaryDocument: summaryDocument,
+            summaryRetries: pendingSummaryRetries
         )
 
-        do {
-            currentSessionMetadata = try meetingSessionStore.save(snapshot: snapshot)
-            currentSessionStartedAt = currentSessionMetadata?.startedAt
-            refreshMeetingHistory()
-            exportLiveHandoffIfPossible()
-        } catch {
-            lastError = "自動保存會議失敗：\(error.localizedDescription)"
+        let hasMeetingContent = !transcriptMarkdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !highlightsMarkdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let artifactIntent: MeetingPersistenceArtifactIntent
+        if shouldPublishFinalArtifacts {
+            artifactIntent = .final(
+                highlightsDirectory: highlightsDirectory,
+                codexHandoffDirectory: codexHandoffDirectory,
+                includeCodexHandoff: codexHandoffEnabled
+            )
+        } else if codexHandoffEnabled, isRecording || hasMeetingContent {
+            artifactIntent = .live(
+                isRecording: isRecording,
+                codexHandoffDirectory: codexHandoffDirectory
+            )
+        } else {
+            artifactIntent = .none
         }
+
+        persistenceRevision &+= 1
+        let token = PersistenceRevisionToken(
+            sessionID: metadata.id,
+            epoch: persistenceEpoch,
+            revision: persistenceRevision
+        )
+        latestPersistenceRevisionBySession[metadata.id] = token.revision
+        let request = MeetingPersistenceRequest(
+            snapshot: snapshot,
+            artifactIntent: artifactIntent
+        )
+        let delay = debounceNanoseconds
+            ?? ((endedAt != nil || finalExport) ? 0 : 250_000_000)
+
+        return Task { [weak self, meetingPersistenceCoordinator] in
+            do {
+                let outcome = try await meetingPersistenceCoordinator.submit(
+                    token: token,
+                    payload: request,
+                    debounceNanoseconds: delay
+                )
+                guard case let .committed(result) = outcome else { return false }
+                self?.applyPersistenceResult(result)
+                // A boundary commit is not complete when its requested
+                // handoff/highlights export failed. Callers that switch
+                // sessions or terminate must remain in place and allow retry.
+                return result.artifactWarning == nil
+            } catch {
+                self?.applyPersistenceFailure(error, token: token)
+                return false
+            }
+        }
+    }
+
+    private func applyPersistenceResult(_ result: MeetingPersistenceResult) {
+        let committedMetadata = result.commit.snapshot.metadata
+        let record = MeetingSessionHistoryRecord(snapshot: result.commit.snapshot)
+        if latestPersistenceRevisionBySession[committedMetadata.id] == result.token.revision {
+            upsertCommittedHistoryRecord(record)
+        }
+
+        guard currentSessionMetadata?.id == result.token.sessionID,
+              persistenceEpoch == result.token.epoch,
+              latestPersistenceRevisionBySession[result.token.sessionID] == result.token.revision else {
+            return
+        }
+
+        currentSessionMetadata = committedMetadata
+        currentSessionStartedAt = committedMetadata.startedAt
+        currentSessionCommit = result.commit
+        if let artifact = result.artifactResult {
+            lastRecordingFilePath = artifact.recordingURL?.path ?? committedMetadata.recordingFilePath ?? ""
+            lastHighlightsFilePath = artifact.highlightsURL.path
+            lastCodexHandoffPath = artifact.codexHandoffMarkdownURL?.path ?? ""
+            if committedMetadata.endedAt != nil {
+                artifactStatusText = artifact.codexHandoffMarkdownURL == nil
+                    ? "已輸出錄音與會議重點"
+                    : "已輸出錄音、重點與 Codex handoff"
+            } else if artifact.codexHandoffMarkdownURL != nil {
+                artifactStatusText = "即時 handoff 已更新"
+            }
+        }
+        if let warning = result.artifactWarning {
+            lastError = "會議已保存，但輸出附件失敗：\(warning)"
+            artifactStatusText = "會議已保存；附件輸出失敗"
+        }
+        if let verification = result.latestValidHandoffVerification {
+            latestValidCodexHandoffExists = verification.exists
+            latestValidCodexHandoffReady = verification.isReady
+        }
+        // Committed transcript/highlights are already in memory. Do not decode
+        // the growing authority envelope again on the main actor after every
+        // recognition autosave.
+        deliveryArtifactChecks = result.deliveryArtifactChecks
+        lastArtifactTrustCacheRefreshAt = Date()
+    }
+
+    private func applyPersistenceFailure(
+        _ error: Error,
+        token: PersistenceRevisionToken
+    ) {
+        guard currentSessionMetadata?.id == token.sessionID,
+              persistenceEpoch == token.epoch,
+              latestPersistenceRevisionBySession[token.sessionID] == token.revision else {
+            return
+        }
+        lastError = "自動保存會議失敗：\(error.localizedDescription)"
     }
 
     func clearLiveDraftState() {
@@ -1652,11 +2179,41 @@ final class SpeechTranscriptionService: ObservableObject {
         resetCommittedTranscriptTracking()
     }
 
+    func updateTranscriptManually(_ updatedTranscript: String) {
+        guard !isTerminationQuiescing, activeSessionOperationID == nil else { return }
+        guard !isViewingHistoricalSession, updatedTranscript != transcript else {
+            return
+        }
+        cancelInFlightSummaryRequestForTranscriptMutation()
+        transcript = updatedTranscript
+        let invalidatedSummary = resetSummaryCoverageIfTranscriptChanged(summaryTranscriptOutput())
+        lastUpdatedAt = Date()
+        manualTranscriptEditInvalidatedSummary = manualTranscriptEditInvalidatedSummary || invalidatedSummary
+        manualTranscriptEditTask?.cancel()
+        summaryStatusText = invalidatedSummary ? "逐字稿已修改，將重新整理" : "逐字稿編輯中"
+        manualTranscriptEditTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            guard !Task.isCancelled else { return }
+            self?.finishManualTranscriptEdit()
+        }
+    }
+
     func visibleTranscriptOutput() -> String {
         [transcript, liveDraftTranscriptLine()]
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
             .joined(separator: "\n")
+    }
+
+    private func summaryTranscriptOutput() -> String {
+        transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func summarySourcePrefixFingerprint(_ transcript: String, endOffset: Int) -> String {
+        let boundedEnd = min(max(0, endOffset), transcript.count)
+        return SummaryPipelineIdentity.rawOperationsFingerprint(
+            Data(String(transcript.prefix(boundedEnd)).utf8)
+        )
     }
 
     private func liveDraftTranscriptLine() -> String {
@@ -1707,6 +2264,9 @@ final class SpeechTranscriptionService: ObservableObject {
             },
             onStatus: { [weak self] status in
                 self?.speechRecognitionStatusText = status
+                if status == "SpeechAnalyzer 辨識中斷" {
+                    self?.handleRecognitionEngineFailure(status)
+                }
             }
         )
     }
@@ -1725,6 +2285,9 @@ final class SpeechTranscriptionService: ObservableObject {
             },
             onStatus: { [weak self] status in
                 self?.systemAudioInputStatusText = "系統音訊 \(status)"
+                if status == "SpeechAnalyzer 辨識中斷" {
+                    self?.handleRecognitionEngineFailure("系統音訊 \(status)")
+                }
             }
         )
     }
@@ -1991,7 +2554,16 @@ final class SpeechTranscriptionService: ObservableObject {
         }
     }
 
-    private func handleRecognition(text: String?, isFinal: Bool, errorMessage: String?) {
+    private func handleRecognition(
+        text: String?,
+        isFinal: Bool,
+        errorMessage: String?,
+        generation: UInt64
+    ) {
+        // SFSpeechRecognitionTask delivers on a non-main callback and then
+        // hops to MainActor. A result already queued before stop/cancel must
+        // not mutate the ended session after its boundary snapshot was taken.
+        guard generation == recognitionGeneration else { return }
         if let text {
             recognitionUpdateCount += 1
             speechRecognitionStatusText = "Speech 回傳 \(recognitionUpdateCount) 次"
@@ -2013,12 +2585,28 @@ final class SpeechTranscriptionService: ObservableObject {
             if Self.isExpectedCancellation(errorMessage) {
                 return
             }
+            handleRecognitionEngineFailure(errorMessage)
+        }
+    }
 
-            speechRecognitionStatusText = "辨識中斷"
-            lastError = errorMessage
-            Task {
-                await stopRecording()
+    private func handleRecognitionEngineFailure(_ message: String) {
+        speechRecognitionStatusText = "辨識中斷"
+        lastError = message
+
+        switch recordingLifecycle.state {
+        case .startingNewSession, .startingRecordingPart:
+            // startRecording owns the active session operation. Mark its
+            // lifecycle as stopping so its next post-await guard aborts and
+            // cleans up, instead of attempting a nested stop that the gate
+            // must reject.
+            _ = recordingLifecycle.requestStop()
+            statusText = "辨識啟動失敗"
+        case .recording:
+            Task { [weak self] in
+                await self?.stopRecording()
             }
+        case .idle, .ready, .stopping, .ended, .loadedHistory:
+            break
         }
     }
 
@@ -2056,15 +2644,22 @@ final class SpeechTranscriptionService: ObservableObject {
 
         recognitionRequest = request
         audioRouter.route(to: request)
+        let callbackGeneration = recognitionGeneration
         recognitionTask = Self.startRecognitionTask(
             recognizer: speechRecognizer,
             request: request
         ) { [weak self] text, isFinal, errorMessage in
-            self?.handleRecognition(text: text, isFinal: isFinal, errorMessage: errorMessage)
+            self?.handleRecognition(
+                text: text,
+                isFinal: isFinal,
+                errorMessage: errorMessage,
+                generation: callbackGeneration
+            )
         }
     }
 
     private func stopRecognitionOnly() {
+        recognitionGeneration &+= 1
         pendingCommitTask?.cancel()
         pendingCommitTask = nil
         audioRouter.close()
@@ -2212,7 +2807,11 @@ final class SpeechTranscriptionService: ObservableObject {
         lastCommittedTranscriptTimestamp = timestamp
         lastCommittedTranscriptSource = source
         lastUpdatedAt = Date()
+        _ = resetSummaryCoverageIfTranscriptChanged(summaryTranscriptOutput())
         autosaveCurrentSession()
+        if isSummaryRequestInFlight {
+            shouldRunSummaryAfterCurrentRequest = true
+        }
         evaluateAutomaticSummaryTrigger()
     }
 
@@ -2241,7 +2840,11 @@ final class SpeechTranscriptionService: ObservableObject {
         lastCommittedTranscriptSource = source
         lastUpdatedAt = Date()
         replaceLastTranscriptSegment(trimmed, timestamp: timestamp, source: source)
+        _ = resetSummaryCoverageIfTranscriptChanged(summaryTranscriptOutput())
         autosaveCurrentSession()
+        if isSummaryRequestInFlight {
+            shouldRunSummaryAfterCurrentRequest = true
+        }
         evaluateAutomaticSummaryTrigger()
     }
 
@@ -2340,6 +2943,9 @@ final class SpeechTranscriptionService: ObservableObject {
         summaryTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 30_000_000_000)
+                guard !Task.isCancelled else {
+                    return
+                }
                 await self?.evaluateAutomaticSummaryTrigger()
             }
         }
@@ -2409,11 +3015,19 @@ final class SpeechTranscriptionService: ObservableObject {
     }
 
     private func postRecordingSummaryStatusText(prefix: String) -> String {
-        "\(prefix) · 未整理 \(unsummarizedTranscriptCount)"
+        let retryCount = retryableSummaryRetries.count
+        let retrySuffix = retryCount == 0 ? "" : " · 待重試 \(retryCount) 批"
+        return "\(prefix) · 未整理 \(unsummarizedTranscriptCount)\(retrySuffix)"
     }
 
     private var shouldContinuePostRecordingSummaryDrain: Bool {
-        summaryProvider != .disabled && unsummarizedTranscriptCount > 0
+        summaryProvider != .disabled && (unsummarizedTranscriptCount > 0 || !retryableSummaryRetries.isEmpty)
+    }
+
+    private var retryableSummaryRetries: [PendingSummaryRetry] {
+        pendingSummaryRetries.filter {
+            $0.attempts < Self.maximumBackgroundSummaryRetryAttempts
+        }
     }
 
     private func evaluateAutomaticSummaryTrigger() {
@@ -2425,21 +3039,34 @@ final class SpeechTranscriptionService: ObservableObject {
     }
 
     private func shouldRunAutomaticSummary() -> Bool {
-        guard summaryProvider != .disabled,
+        guard isRecording,
+              !isViewingHistoricalSession,
+              manualTranscriptEditTask == nil,
+              summaryProvider != .disabled,
               summaryTriggerMode != .manualOnly,
               !isSummaryRequestInFlight else {
             return false
         }
 
-        let liveText = visibleTranscriptOutput()
+        let liveText = summaryTranscriptOutput()
         guard !liveText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return false
         }
+
+        let transcriptWasRewritten = resetSummaryCoverageIfTranscriptChanged(liveText)
 
         let newCharacterCount = liveText.count - min(lastSummarizedTranscriptCharacterCount, liveText.count)
         let characterReached = newCharacterCount >= max(100, summaryCharacterThreshold)
         let lastAutomaticSummaryAt = lastAutomaticSummaryAt ?? Date()
         let timeReached = Date().timeIntervalSince(lastAutomaticSummaryAt) >= max(30, summaryIntervalSeconds)
+
+        if !retryableSummaryRetries.isEmpty && timeReached {
+            return true
+        }
+
+        if transcriptWasRewritten {
+            return true
+        }
 
         switch summaryTriggerMode {
         case .time:
@@ -2457,16 +3084,18 @@ final class SpeechTranscriptionService: ObservableObject {
 
     @discardableResult
     private func runMeetingSummary(isFinal: Bool, force: Bool = false) -> Bool {
-        let liveText = visibleTranscriptOutput()
+        let liveText = summaryTranscriptOutput()
         guard !liveText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return false
         }
+        _ = resetSummaryCoverageIfTranscriptChanged(liveText)
 
         let safeStart = min(lastSummarizedTranscriptCharacterCount, liveText.count)
         let newStartIndex = liveText.index(liveText.startIndex, offsetBy: safeStart)
         let newTranscript = String(liveText[newStartIndex...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let pendingRetry = validatedPendingSummaryRetry(against: liveText)
 
-        guard force || isFinal || !newTranscript.isEmpty else {
+        guard force || isFinal || !newTranscript.isEmpty || pendingRetry != nil else {
             return false
         }
 
@@ -2484,19 +3113,28 @@ final class SpeechTranscriptionService: ObservableObject {
         shouldRunFinalSummaryAfterCurrentRequest = false
 
         let executionConfiguration = makeSummaryExecutionConfiguration()
-        let currentState = liveSummaryState
+        let currentCatalog = Self.summaryCatalogJSON(from: summaryDocument)
+        let existingTopicIDs = Set(summaryDocument.topics.flatMap { topic in
+            [topic.id] + topic.aliases
+        })
         let requestGeneration = summaryGeneration
         let requestPlan = makeSummaryRequestPlan(
             liveText: liveText,
             newTranscript: newTranscript,
             safeStart: safeStart,
-            isFinal: isFinal
+            isFinal: isFinal,
+            retry: pendingRetry
         )
         summaryStatusText = requestPlan.requestIsFinal
             ? "最後梳理中"
             : (isFinal ? "最後分段整理中" : "整理中")
 
         summaryRequestTask = Task { [weak self] in
+            guard let self else { return }
+            guard self.isSummaryRequestSourceCurrent(requestPlan) else {
+                self.discardStaleSummaryRequest()
+                return
+            }
             do {
                 switch executionConfiguration {
                 case .openAICompatible(let baseURL, let apiKey, let model):
@@ -2507,21 +3145,23 @@ final class SpeechTranscriptionService: ObservableObject {
                             model: model
                         )
                     )
-                    let state = try await summarizer.summarize(
-                        newTranscript: requestPlan.payloadTranscript,
-                        recentTranscript: requestPlan.recentTranscript,
-                        currentState: currentState,
-                        isFinal: requestPlan.requestIsFinal
+                    let delta = try SummaryProviderDeltaValidator.validated(
+                        try await summarizer.summarize(
+                            newTranscript: requestPlan.payloadTranscript,
+                            recentTranscript: requestPlan.recentTranscript,
+                            currentCatalog: currentCatalog,
+                            isFinal: requestPlan.requestIsFinal
+                        ),
+                        existingTopicIDs: existingTopicIDs
                     )
-                    self?.applyDeepSeekDiagnostics(summarizer.lastDiagnostics)
-                    await self?.applySummaryState(
-                        state,
-                        summarizedCharacterCount: requestPlan.summarizedCharacterCount,
-                    isFinal: requestPlan.requestIsFinal,
-                    continuation: requestPlan.continuation,
-                    requestGeneration: requestGeneration
-                )
-            case .lmStudioConfigured(let baseURL, let apiToken, let model):
+                    self.applyDeepSeekDiagnostics(summarizer.lastDiagnostics)
+                    await self.applySummaryDelta(
+                        delta,
+                        plan: requestPlan,
+                        isFinal: requestPlan.requestIsFinal,
+                        requestGeneration: requestGeneration
+                    )
+                case .lmStudioConfigured(let baseURL, let apiToken, let model):
                     let transcriptAnalyzer = LMStudioTranscriptPolisher(
                         configuration: .init(
                             baseURL: baseURL,
@@ -2529,43 +3169,50 @@ final class SpeechTranscriptionService: ObservableObject {
                             model: model
                         )
                     )
-                    let notes = try await transcriptAnalyzer.summarizeMeeting(requestPlan.recentTranscript)
-                await self?.applySummaryText(
-                    notes,
-                    summarizedCharacterCount: requestPlan.summarizedCharacterCount,
-                    isFinal: requestPlan.requestIsFinal,
-                    continuation: requestPlan.continuation,
-                    requestGeneration: requestGeneration
-                )
-            case .localFallback(let reason):
-                await self?.applyLocalFallbackSummary(
-                    reason: reason,
-                    transcript: requestPlan.fallbackTranscript,
-                    summarizedCharacterCount: requestPlan.summarizedCharacterCount,
-                    isFinal: requestPlan.requestIsFinal,
-                    continuation: requestPlan.continuation,
-                    requestGeneration: requestGeneration
-                )
-            case .disabled:
-                await self?.applySummaryText(
-                    Self.emptySummaryMarkdown,
-                    summarizedCharacterCount: requestPlan.summarizedCharacterCount,
-                    isFinal: requestPlan.requestIsFinal,
-                    continuation: requestPlan.continuation,
+                    let input = requestPlan.payloadTranscript.isEmpty
+                        ? requestPlan.recentTranscript
+                        : requestPlan.payloadTranscript
+                    let delta = try SummaryProviderDeltaValidator.validated(
+                        try await transcriptAnalyzer.summarizeMeeting(
+                            input,
+                            currentCatalog: currentCatalog,
+                            isFinal: requestPlan.requestIsFinal
+                        ),
+                        existingTopicIDs: existingTopicIDs
+                    )
+                    self.applyLMStudioDiagnostics(transcriptAnalyzer.lastDiagnostics)
+                    await self.applySummaryDelta(
+                        delta,
+                        plan: requestPlan,
+                        isFinal: requestPlan.requestIsFinal,
+                        requestGeneration: requestGeneration
+                    )
+                case .localFallback(let reason):
+                    await self.applyLocalFallbackSummary(
+                        reason: reason,
+                        plan: requestPlan,
+                        retryNeeded: false,
+                        requestGeneration: requestGeneration
+                    )
+                case .disabled:
+                    await self.finishTranscriptOnlySummaryRequest(
+                        plan: requestPlan,
+                        requestGeneration: requestGeneration
+                    )
+                }
+            } catch {
+                guard !Task.isCancelled,
+                      self.isCurrentSummaryGeneration(requestGeneration) else {
+                    return
+                }
+                self.applyDeepSeekDiagnostics(nil)
+                await self.applyLocalFallbackSummary(
+                    reason: error.localizedDescription,
+                    plan: requestPlan,
+                    retryNeeded: true,
                     requestGeneration: requestGeneration
                 )
             }
-            } catch {
-                self?.applyDeepSeekDiagnostics(nil)
-                await self?.applyLocalFallbackSummary(
-                    reason: error.localizedDescription,
-                transcript: requestPlan.fallbackTranscript,
-                summarizedCharacterCount: requestPlan.summarizedCharacterCount,
-                isFinal: requestPlan.requestIsFinal,
-                continuation: requestPlan.continuation,
-                requestGeneration: requestGeneration
-            )
-        }
         }
 
         return true
@@ -2575,123 +3222,353 @@ final class SpeechTranscriptionService: ObservableObject {
         liveText: String,
         newTranscript: String,
         safeStart: Int,
-        isFinal: Bool
+        isFinal: Bool,
+        retry: PendingSummaryRetry?
     ) -> SummaryRequestPlan {
         let recentTranscript = String(liveText.suffix(Self.recentTranscriptCharacterLimit))
-        let chunkLimit = isFinal ? Self.finalSummaryChunkCharacterLimit : Self.liveSummaryChunkCharacterLimit
-        let chunk = String(newTranscript.prefix(chunkLimit)).trimmingCharacters(in: .whitespacesAndNewlines)
-
-        guard !chunk.isEmpty else {
+        if let retry {
+            let hasNewTranscript = !newTranscript.isEmpty
+            let hasMoreRetries = retryableSummaryRetries.count > 1
             return SummaryRequestPlan(
-                payloadTranscript: "",
+                id: retry.id,
+                payloadTranscript: retry.transcript,
+                // Context is recomputed from the currently validated source.
+                // Persisted context is never trusted as outbound request data.
                 recentTranscript: recentTranscript,
-                summarizedCharacterCount: liveText.count,
-                requestIsFinal: isFinal,
-                continuation: .none
+                rangeStart: retry.rangeStart,
+                rangeEnd: retry.rangeEnd,
+                summarizedCharacterCount: lastSummarizedTranscriptCharacterCount,
+                requestIsFinal: isFinal && !hasNewTranscript && !hasMoreRetries,
+                continuation: (hasNewTranscript || hasMoreRetries) ? (isFinal ? .final : .live) : .none,
+                retryID: retry.id,
+                retryRecord: retry,
+                sourcePrefixFingerprint: retry.sourcePrefixFingerprint
+                    ?? Self.summarySourcePrefixFingerprint(liveText, endOffset: retry.rangeEnd)
             )
         }
 
-        let summarizedCharacterCount = min(liveText.count, safeStart + chunk.count)
-        let hasRemainingTranscript = newTranscript.count > chunk.count
+        let chunkLimit = isFinal ? Self.finalSummaryChunkCharacterLimit : Self.liveSummaryChunkCharacterLimit
+        let unsummarizedTranscript = String(liveText.dropFirst(safeStart))
+        let rawChunk = String(unsummarizedTranscript.prefix(chunkLimit))
+        let chunk = rawChunk
+
+        guard !chunk.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return SummaryRequestPlan(
+                id: "summary-\(safeStart)-\(safeStart)-\(isFinal ? "final" : "live")",
+                payloadTranscript: "",
+                recentTranscript: recentTranscript,
+                rangeStart: safeStart,
+                rangeEnd: safeStart,
+                summarizedCharacterCount: safeStart,
+                requestIsFinal: isFinal,
+                continuation: .none,
+                retryID: nil,
+                retryRecord: nil,
+                sourcePrefixFingerprint: Self.summarySourcePrefixFingerprint(liveText, endOffset: safeStart)
+            )
+        }
+
+        let summarizedCharacterCount = min(liveText.count, safeStart + rawChunk.count)
+        let hasRemainingTranscript = unsummarizedTranscript.count > rawChunk.count
 
         return SummaryRequestPlan(
+            id: "summary-\(safeStart)-\(summarizedCharacterCount)-\(isFinal ? "final" : "live")",
             payloadTranscript: chunk,
             recentTranscript: recentTranscript,
+            rangeStart: safeStart,
+            rangeEnd: summarizedCharacterCount,
             summarizedCharacterCount: summarizedCharacterCount,
             requestIsFinal: isFinal && !hasRemainingTranscript,
-            continuation: hasRemainingTranscript ? (isFinal ? .final : .live) : .none
+            continuation: hasRemainingTranscript ? (isFinal ? .final : .live) : .none,
+            retryID: nil,
+            retryRecord: nil,
+            sourcePrefixFingerprint: Self.summarySourcePrefixFingerprint(
+                liveText,
+                endOffset: summarizedCharacterCount
+            )
         )
     }
 
-    private func applySummaryState(
-        _ state: LiveMeetingSummaryState,
-        summarizedCharacterCount: Int,
+    private func applySummaryDelta(
+        _ providerDelta: MeetingSummaryDelta,
+        plan: SummaryRequestPlan,
         isFinal: Bool,
-        continuation: SummaryContinuation = .none,
         requestGeneration: Int? = nil
     ) {
         guard isCurrentSummaryGeneration(requestGeneration) else {
             return
         }
-
-        let hadExistingSummary = !liveSummaryState.isEmpty
-        let mergedState = liveSummaryState.merged(with: state)
-        liveSummaryState = mergedState
-        meetingNotes = mergedState.markdown()
-        lastSummarizedTranscriptCharacterCount = summarizedCharacterCount
-        queueSummaryContinuation(continuation)
-        finishSummaryRequest(
-            isFinal: isFinal,
-            statusText: state.isEmpty && hadExistingSummary ? "無新增重點，已保留" : nil
-        )
-    }
-
-    private func applySummaryText(
-        _ text: String,
-        summarizedCharacterCount: Int,
-        isFinal: Bool,
-        statusText: String? = nil,
-        continuation: SummaryContinuation = .none,
-        requestGeneration: Int? = nil
-    ) {
-        guard isCurrentSummaryGeneration(requestGeneration) else {
+        guard isSummaryRequestSourceCurrent(plan) else {
+            discardStaleSummaryRequest()
             return
         }
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let operationData = (try? encoder.encode(providerDelta.operations)) ?? Data()
+        let operationsFingerprint = SummaryPipelineIdentity.rawOperationsFingerprint(operationData)
+        let effectiveDeltaID = SummaryPipelineIdentity.providerDeltaID(
+            meetingID: summaryDocument.id,
+            rangeStart: plan.rangeStart,
+            rangeEnd: plan.rangeEnd,
+            isFinal: plan.requestIsFinal,
+            retryKey: plan.retryID,
+            sourceFingerprint: plan.sourcePrefixFingerprint,
+            operationsFingerprint: operationsFingerprint
+        )
+        guard !summaryDocument.appliedDeltaIDs.contains(effectiveDeltaID) else {
+            queueSummaryContinuation(plan.continuation)
+            finishSummaryRequest(isFinal: isFinal, statusText: "重複批次已忽略")
+            return
+        }
+
+        if let retryID = plan.retryID {
+            pendingSummaryRetries.removeAll { $0.id == retryID }
+            accumulatedFallbackSummaryUnits = max(0, accumulatedFallbackSummaryUnits - plan.unitCount)
+            accumulatedAISummaryUnits += plan.unitCount
+        } else {
+            lastSummarizedTranscriptCharacterCount = max(
+                lastSummarizedTranscriptCharacterCount,
+                plan.summarizedCharacterCount
+            )
+            rememberSummarizedTranscriptPrefix()
+            accumulatedAISummaryUnits += plan.unitCount
+        }
+
+        let totalUnits = summaryTranscriptOutput().count
+        var operations = providerDelta.operations
+        operations.append(contentsOf: currentFallbackProjectionOperations())
+        operations.append(.updateProcessing(makeProcessingState(totalUnits: totalUnits, lastError: nil)))
+        applyDocumentDelta(.init(id: effectiveDeltaID, operations: operations))
 
         lastError = nil
-        meetingNotes = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        lastSummarizedTranscriptCharacterCount = summarizedCharacterCount
-        queueSummaryContinuation(continuation)
-        finishSummaryRequest(isFinal: isFinal, statusText: statusText)
+        queueSummaryContinuation(plan.continuation)
+        finishSummaryRequest(
+            isFinal: isFinal,
+            statusText: providerDelta.operations.isEmpty ? "無新增重點，已保留" : nil
+        )
+    }
+
+    private func finishTranscriptOnlySummaryRequest(
+        plan: SummaryRequestPlan,
+        requestGeneration: Int? = nil
+    ) {
+        guard isCurrentSummaryGeneration(requestGeneration) else {
+            return
+        }
+        finishSummaryRequest(isFinal: plan.requestIsFinal, statusText: "僅逐字稿模式")
     }
 
     private func applyLocalFallbackSummary(
         reason: String,
-        transcript: String,
-        summarizedCharacterCount: Int,
-        isFinal: Bool,
-        continuation: SummaryContinuation = .none,
+        plan: SummaryRequestPlan,
+        retryNeeded: Bool,
         requestGeneration: Int? = nil
     ) {
         guard isCurrentSummaryGeneration(requestGeneration) else {
             return
         }
+        guard isSummaryRequestSourceCurrent(plan) else {
+            discardStaleSummaryRequest()
+            return
+        }
 
-        let fallbackSummary = Self.localFallbackSummaryMarkdown(from: transcript)
-        let existingNotes = meetingNotes.trimmingCharacters(in: .whitespacesAndNewlines)
-        let isPostRecordingFinalDrain = continuation == .final
-        let didApplyFallback: Bool
-        if existingNotes.isEmpty || liveSummaryState.isEmpty {
-            meetingNotes = fallbackSummary
-            lastError = "AI 整理未完成，已改用本機粗整理：\(reason)"
-            didApplyFallback = true
-        } else if isFinal || isPostRecordingFinalDrain {
-            meetingNotes = """
-            \(existingNotes)
+        guard plan.unitCount > 0 else {
+            let processingError = Self.sanitizedSummaryError(reason)
+            applyDocumentDelta(.init(
+                id: "fallback-empty-\(plan.id)-\(UUID().uuidString)",
+                operations: [.updateProcessing(makeProcessingState(
+                    totalUnits: summaryTranscriptOutput().count,
+                    lastError: processingError
+                ))]
+            ))
+            lastError = "AI 最後梳理未完成，已保留既有重點：\(processingError)"
+            queueSummaryContinuation(plan.continuation)
+            finishSummaryRequest(isFinal: plan.requestIsFinal, statusText: "已保留既有重點")
+            return
+        }
 
-            ---
-
-            ## 本機備援補充
-
-            \(fallbackSummary)
-            """
-            lastError = "AI 會後分段整理未完成，已保留既有重點並附上本機補充：\(reason)"
-            didApplyFallback = true
+        var willRetry = retryNeeded
+        if let retryID = plan.retryID,
+           let index = pendingSummaryRetries.firstIndex(where: { $0.id == retryID }) {
+            if retryNeeded {
+                pendingSummaryRetries[index].attempts += 1
+            } else {
+                pendingSummaryRetries[index].attempts = Self.maximumBackgroundSummaryRetryAttempts
+            }
+            willRetry = pendingSummaryRetries[index].attempts < Self.maximumBackgroundSummaryRetryAttempts
         } else {
-            meetingNotes = existingNotes
-            lastError = "AI 整理未完成，已保留既有重點：\(reason)"
-            didApplyFallback = false
+            lastSummarizedTranscriptCharacterCount = max(
+                lastSummarizedTranscriptCharacterCount,
+                plan.summarizedCharacterCount
+            )
+            rememberSummarizedTranscriptPrefix()
+            accumulatedFallbackSummaryUnits += plan.unitCount
+            let attempts = retryNeeded ? 1 : Self.maximumBackgroundSummaryRetryAttempts
+            pendingSummaryRetries.append(PendingSummaryRetry(
+                id: "retry-\(plan.id)",
+                transcript: plan.fallbackTranscript,
+                recentTranscript: plan.recentTranscript,
+                rangeStart: plan.rangeStart,
+                rangeEnd: plan.rangeEnd,
+                isFinal: plan.requestIsFinal,
+                attempts: attempts,
+                sourcePrefixFingerprint: plan.sourcePrefixFingerprint
+            ))
+            willRetry = attempts < Self.maximumBackgroundSummaryRetryAttempts
         }
-        if didApplyFallback {
-            lastSummarizedTranscriptCharacterCount = summarizedCharacterCount
-            queueSummaryContinuation(continuation)
-        }
-        finishSummaryRequest(
-            isFinal: isFinal,
-            statusText: existingNotes.isEmpty || liveSummaryState.isEmpty
-            ? (isFinal ? "本機備援完成" : "本機備援已更新")
-            : ((isFinal || isPostRecordingFinalDrain) ? "已保留並補充" : "已保留既有重點")
+
+        let processingError = Self.sanitizedSummaryError(reason)
+        let processing = makeProcessingState(
+            totalUnits: summaryTranscriptOutput().count,
+            lastError: processingError
         )
+        var operations = currentFallbackProjectionOperations()
+        operations.append(.updateProcessing(processing))
+        applyDocumentDelta(.init(
+            id: "fallback-\(plan.id)-\(UUID().uuidString)",
+            operations: operations
+        ))
+
+        let retryText = willRetry ? "；已排入重試" : ""
+        lastError = "AI 整理未完成，已保留既有重點並以本機粗整理替代\(retryText)：\(processingError)"
+        queueSummaryContinuation(plan.continuation)
+        finishSummaryRequest(
+            isFinal: plan.requestIsFinal,
+            statusText: willRetry ? "本機備援已更新 · 待重試" : "本機備援已更新"
+        )
+    }
+
+    private func applyDocumentDelta(_ delta: MeetingSummaryDelta) {
+        summaryDocument = MeetingSummaryReducer.applying(delta, to: summaryDocument)
+        liveSummaryState = Self.legacyProjection(from: summaryDocument)
+        meetingNotes = MeetingSummaryRenderer.render(summaryDocument)
+        rawMeetingNotes = meetingNotes
+    }
+
+    @discardableResult
+    private func resetSummaryCoverageIfTranscriptChanged(_ currentTranscript: String) -> Bool {
+        guard lastSummarizedTranscriptCharacterCount > 0 else {
+            return false
+        }
+
+        let boundedCount = min(lastSummarizedTranscriptCharacterCount, currentTranscript.count)
+        let currentPrefix = String(currentTranscript.prefix(boundedCount))
+        guard boundedCount != lastSummarizedTranscriptCharacterCount
+                || currentPrefix != lastSummarizedTranscriptPrefix else {
+            return false
+        }
+
+        summaryGeneration += 1
+        summaryRequestTask?.cancel()
+        summaryRequestTask = nil
+        isSummaryRequestInFlight = false
+        shouldRunSummaryAfterCurrentRequest = false
+        shouldRunFinalSummaryAfterCurrentRequest = false
+        lastSummarizedTranscriptCharacterCount = 0
+        lastSummarizedTranscriptPrefix = ""
+        accumulatedAISummaryUnits = 0
+        accumulatedFallbackSummaryUnits = 0
+        pendingSummaryRetries = []
+        let preservedItems = summaryDocument.items.filter {
+            $0.source == .manual || $0.lockedByUser
+        }
+        let preservedTopicIDs = Set(preservedItems.map(\.topicID))
+        summaryDocument.items = preservedItems
+        summaryDocument.topics = summaryDocument.topics.filter { preservedTopicIDs.contains($0.id) }
+        if summaryDocument.headlineLockedByUser != true {
+            summaryDocument.headline = ""
+        }
+        summaryDocument.processing = .init(
+            totalUnits: currentTranscript.count,
+            processedUnits: 0,
+            pendingUnits: currentTranscript.count,
+            lastError: "逐字稿已修改，原 AI／本機備援重點已失效，需重新整理"
+        )
+        summaryDocument.appliedDeltaIDs = []
+        summaryDocument.revision += 1
+        liveSummaryState = Self.legacyProjection(from: summaryDocument)
+        meetingNotes = MeetingSummaryRenderer.render(summaryDocument)
+        rawMeetingNotes = meetingNotes
+        lastError = "逐字稿已修改；已保留人工鎖定內容，其他重點需要重新整理。"
+        summaryStatusText = "逐字稿已修改，將重新整理"
+        return true
+    }
+
+    private func rememberSummarizedTranscriptPrefix() {
+        let currentTranscript = summaryTranscriptOutput()
+        let boundedCount = min(lastSummarizedTranscriptCharacterCount, currentTranscript.count)
+        lastSummarizedTranscriptPrefix = String(currentTranscript.prefix(boundedCount))
+    }
+
+    private func reconcileSummaryProcessing(totalUnits: Int) {
+        let processing = makeProcessingState(
+            totalUnits: totalUnits,
+            lastError: summaryDocument.processing.lastError
+        )
+        guard processing != summaryDocument.processing else {
+            return
+        }
+        applyDocumentDelta(.init(
+            id: "processing-sync-\(UUID().uuidString)",
+            operations: [.updateProcessing(processing)]
+        ))
+    }
+
+    private func makeProcessingState(
+        totalUnits: Int,
+        lastError: String?
+    ) -> MeetingSummaryProcessingState {
+        let boundedTotal = max(0, totalUnits)
+        let processed = min(max(0, lastSummarizedTranscriptCharacterCount), boundedTotal)
+        let ai = min(max(0, accumulatedAISummaryUnits), processed)
+        let fallback = min(max(0, accumulatedFallbackSummaryUnits), max(0, processed - ai))
+        return MeetingSummaryProcessingState(
+            totalUnits: boundedTotal,
+            processedUnits: processed,
+            aiUnits: ai,
+            fallbackUnits: fallback,
+            pendingUnits: max(0, boundedTotal - processed),
+            retryUnits: retryableSummaryRetries.reduce(0) { $0 + $1.unitCount },
+            lastError: lastError
+        )
+    }
+
+    private func currentFallbackProjectionOperations() -> [MeetingSummaryDeltaOperation] {
+        guard !pendingSummaryRetries.isEmpty else {
+            let hasFallbackProjection = summaryDocument.items.contains {
+                $0.fallbackScopeID == Self.fallbackScopeID
+            }
+            if accumulatedFallbackSummaryUnits > 0 {
+                return []
+            }
+            return hasFallbackProjection ? [Self.emptyFallbackProjectionOperation] : []
+        }
+        return Self.fallbackProjectionOperations(from: pendingSummaryRetries)
+    }
+
+    private static var emptyFallbackProjectionOperation: MeetingSummaryDeltaOperation {
+        .replaceFallback(
+            scopeID: fallbackScopeID,
+            topic: .init(id: fallbackTopicID, title: "本機備援補充", order: Int.max - 1),
+            items: []
+        )
+    }
+
+    private static func fallbackProjectionOperations(from retries: [PendingSummaryRetry]) -> [MeetingSummaryDeltaOperation] {
+        let ranges = retries.map {
+            SummaryFallbackRange(
+                id: $0.id,
+                transcript: $0.transcript,
+                rangeStart: $0.rangeStart,
+                rangeEnd: $0.rangeEnd
+            )
+        }
+        return [SummaryFallbackProjection.operation(
+            from: ranges,
+            scopeID: fallbackScopeID,
+            topicID: fallbackTopicID
+        )]
     }
 
     private func queueSummaryContinuation(_ continuation: SummaryContinuation) {
@@ -2713,6 +3590,73 @@ final class SpeechTranscriptionService: ObservableObject {
         return requestGeneration == summaryGeneration
     }
 
+    private func isSummaryRequestSourceCurrent(_ plan: SummaryRequestPlan) -> Bool {
+        let currentTranscript = summaryTranscriptOutput()
+        guard currentTranscript.count >= plan.rangeEnd else {
+            return false
+        }
+        if let retryRecord = plan.retryRecord,
+           !MeetingSummaryRetryValidator.isExecutable(
+               retryRecord,
+               against: currentTranscript
+           ) {
+            return false
+        }
+        return Self.summarySourcePrefixFingerprint(
+            currentTranscript,
+            endOffset: plan.rangeEnd
+        ) == plan.sourcePrefixFingerprint
+    }
+
+    private func validatedPendingSummaryRetry(
+        against liveText: String
+    ) -> PendingSummaryRetry? {
+        let validation = MeetingSummaryRetryValidator.validate(
+            pendingSummaryRetries,
+            against: liveText
+        )
+        pendingSummaryRetries = validation.valid
+        if !validation.quarantined.isEmpty {
+            lastError = "已隔離 \(validation.quarantined.count) 筆失效的摘要重試；不會送往 AI 服務。"
+        }
+        return validation.valid.first {
+            MeetingSummaryRetryValidator.isExecutable($0, against: liveText)
+        }
+    }
+
+    private func discardStaleSummaryRequest() {
+        isSummaryRequestInFlight = false
+        summaryRequestTask = nil
+        summaryStatusText = "逐字稿已更新，已丟棄過期整理結果"
+        if isRecording {
+            evaluateAutomaticSummaryTrigger()
+        } else if summaryProvider != .disabled {
+            startPostRecordingSummaryDrain()
+        }
+    }
+
+    private func cancelInFlightSummaryRequestForTranscriptMutation() {
+        guard isSummaryRequestInFlight else { return }
+        summaryGeneration += 1
+        summaryRequestTask?.cancel()
+        summaryRequestTask = nil
+        isSummaryRequestInFlight = false
+        shouldRunSummaryAfterCurrentRequest = false
+        shouldRunFinalSummaryAfterCurrentRequest = false
+    }
+
+    private func finishManualTranscriptEdit() {
+        manualTranscriptEditTask = nil
+        let invalidatedSummary = manualTranscriptEditInvalidatedSummary
+        manualTranscriptEditInvalidatedSummary = false
+        autosaveCurrentSession()
+        if !isRecording, summaryProvider != .disabled {
+            startPostRecordingSummaryDrain()
+        } else if invalidatedSummary || isRecording {
+            evaluateAutomaticSummaryTrigger()
+        }
+    }
+
     private func applyDeepSeekDiagnostics(_ diagnostics: DeepSeekMeetingDiagnostics?) {
         guard let diagnostics else {
             return
@@ -2720,7 +3664,14 @@ final class SpeechTranscriptionService: ObservableObject {
 
         let rate = Int((diagnostics.cacheHitRate * 100).rounded())
         let finish = diagnostics.finishReason ?? "unknown"
-        deepSeekDiagnosticsText = "DeepSeek cache \(rate)% · hit \(diagnostics.promptCacheHitTokens) / miss \(diagnostics.promptCacheMissTokens) · \(finish)"
+        deepSeekDiagnosticsText = "DeepSeek tokens \(diagnostics.promptTokens)/\(diagnostics.completionTokens)/\(diagnostics.totalTokens) · cache \(rate)% · hit \(diagnostics.promptCacheHitTokens) / miss \(diagnostics.promptCacheMissTokens) · finish \(finish)"
+    }
+
+    private func applyLMStudioDiagnostics(_ diagnostics: LMStudioSummaryDiagnostics?) {
+        guard let diagnostics else {
+            return
+        }
+        deepSeekDiagnosticsText = "LM Studio tokens \(diagnostics.inputTokens)/\(diagnostics.outputTokens) · ops \(diagnostics.operationCount) · finish \(diagnostics.finishReason ?? "unknown")"
     }
 
     private func applySummaryError(_ error: Error) {
@@ -2838,75 +3789,76 @@ final class SpeechTranscriptionService: ObservableObject {
         case disabled
     }
 
-    private static func localFallbackSummaryMarkdown(from transcript: String) -> String {
-        let lines = transcript
-            .components(separatedBy: .newlines)
-            .map { line in
-                line.replacingOccurrences(
-                    of: #"^\[[^\]]+\]\s*"#,
-                    with: "",
-                    options: .regularExpression
-                )
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+    private static func summaryCatalogJSON(from document: MeetingSummaryDocument) -> String {
+        let topics: [[String: Any]] = document.topics.map { topic in
+            [
+                "id": topic.id,
+                "title": topic.title,
+                "aliases": topic.aliases
+            ]
+        }
+        let items: [[String: Any]] = document.items
+            .filter { $0.status != .resolved && $0.status != .superseded }
+            .prefix(300)
+            .map { item in
+                var value: [String: Any] = [
+                    "id": item.id,
+                    "topic_id": item.topicID,
+                    "kind": item.kind.rawValue,
+                    "status": item.status.rawValue,
+                    "text": String(item.text.prefix(96)),
+                    "locked_by_user": item.lockedByUser
+                ]
+                if let owner = nilIfBlank(item.owner) {
+                    value["owner"] = owner
+                }
+                if let dueDate = nilIfBlank(item.dueDate) {
+                    value["due_date"] = dueDate
+                }
+                return value
             }
-            .filter { !$0.isEmpty }
-
-        let recentLines = Array(lines.suffix(10))
-        let topicLines = Array(recentLines.prefix(5))
-        let conclusionLines = recentLines.filter { line in
-            let markers = ["決定", "結論", "所以", "需要", "要", "可以", "不能", "問題", "原因"]
-            return markers.contains { line.contains($0) }
+        let payload: [String: Any] = [
+            "headline": String(document.headline.prefix(120)),
+            "topics": topics,
+            "items": items
+        ]
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
+            return #"{"headline":"","topics":[],"items":[]}"#
         }
-        let questionLines = recentLines.filter { line in
-            line.contains("?") ||
-            line.contains("？") ||
-            line.contains("為什麼") ||
-            line.contains("是否") ||
-            line.contains("確認")
-        }
-
-        return """
-        ## 議題主題
-
-        \(Self.bulletMarkdown(from: topicLines, empty: "尚無明確議題"))
-
-        ## 主題結論
-
-        \(Self.bulletMarkdown(from: Array(conclusionLines.prefix(5)), empty: "尚需 AI 或人工確認結論"))
-
-        ## 主題未確認事項
-
-        \(Self.bulletMarkdown(from: Array(questionLines.prefix(5)), empty: "尚無"))
-        """
+        return String(decoding: data, as: UTF8.self)
     }
 
-    private static func bulletMarkdown(from lines: [String], empty: String) -> String {
-        let cleaned = lines
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-
-        guard !cleaned.isEmpty else {
-            return "- \(empty)"
+    private static func legacyProjection(from document: MeetingSummaryDocument) -> LiveMeetingSummaryState {
+        let activeItems = document.items.filter { $0.status != .resolved && $0.status != .superseded }
+        let topics = document.topics.compactMap { topic -> LiveMeetingSummaryState.TopicSummary? in
+            let topicItems = activeItems.filter { $0.topicID == topic.id }
+            if topic.id == fallbackTopicID && topicItems.isEmpty {
+                return nil
+            }
+            let conclusions = topicItems.filter {
+                [.decision, .requirement, .fact, .note].contains($0.kind)
+            }
+            let openItems = topicItems.filter {
+                [.action, .openQuestion, .risk].contains($0.kind)
+            }
+            return .init(
+                topic: topic.title,
+                conclusion: conclusions.map(\.text).joined(separator: "；"),
+                openItems: openItems.map(\.text)
+            )
         }
-
-        return cleaned
-            .map { "- \($0)" }
-            .joined(separator: "\n")
+        return LiveMeetingSummaryState(topics: topics)
     }
 
-    private static let emptySummaryMarkdown = """
-    ## 議題主題
+    private static func sanitizedSummaryError(_ reason: String) -> String {
+        SummaryErrorSanitizer.sanitize(reason)
+    }
 
-    - 尚無明確議題
-
-    ## 主題結論
-
-    - 尚無明確結論
-
-    ## 主題未確認事項
-
-    - 尚無
-    """
+    private static func nilIfBlank(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
 
     private static let summaryDefaultsVersionKey = "summary.defaults.version"
     private static let summaryProviderKey = "summary.provider"

@@ -1,6 +1,21 @@
 import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
+import MoMoWhisperSummaryCore
+
+private enum CompactLivePane: String, CaseIterable, Identifiable {
+    case transcript
+    case summary
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .transcript: return "逐字稿"
+        case .summary: return "會議重點"
+        }
+    }
+}
 
 @MainActor
 struct ContentView: View {
@@ -10,7 +25,9 @@ struct ContentView: View {
     @State private var showingSettings = false
     @State private var showingHistory = false
     @State private var showingOnboarding = false
+    @State private var showingSummaryDiagnostics = false
     @State private var selectedSection: WorkspaceSection = .live
+    @State private var compactLivePane: CompactLivePane = .transcript
     @AppStorage("momowhisper.onboarding.completed.v1") private var onboardingCompleted = false
 
     var body: some View {
@@ -35,7 +52,7 @@ struct ContentView: View {
                         Group {
                             switch selectedSection {
                             case .live:
-                                liveWorkspace(isCompact: geometry.size.width < 980)
+                                liveWorkspace(isCompact: geometry.size.width < 1_100)
                             case .commandCenter:
                                 commandCenter
                             }
@@ -81,14 +98,27 @@ struct ContentView: View {
     @ViewBuilder
     private func liveWorkspace(isCompact: Bool) -> some View {
         if isCompact {
-            ScrollView {
-                VStack(spacing: 0) {
-                    transcriptPane
-                        .frame(minHeight: 420)
-                    Divider().overlay(AppTheme.border)
-                    summaryPane
-                        .frame(minHeight: 560)
+            VStack(spacing: 0) {
+                Picker("目前內容", selection: $compactLivePane) {
+                    ForEach(CompactLivePane.allCases) { pane in
+                        Text(pane.title).tag(pane)
+                    }
                 }
+                .pickerStyle(.segmented)
+                .padding(.horizontal, 18)
+                .padding(.vertical, 10)
+
+                Divider().overlay(AppTheme.border)
+
+                Group {
+                    switch compactLivePane {
+                    case .transcript:
+                        transcriptPane
+                    case .summary:
+                        summaryPane
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .background(AppTheme.background)
         } else {
@@ -336,7 +366,7 @@ struct ContentView: View {
             }
             .menuStyle(.borderlessButton)
         }
-        .disabled(transcriber.isRecording)
+        .disabled(transcriber.isRecording || transcriber.isSessionTransitionInProgress)
         .help("選擇語音辨識語言")
     }
 
@@ -353,7 +383,11 @@ struct ContentView: View {
             }
             .menuStyle(.borderlessButton)
         }
-        .disabled(transcriber.isRecording || !transcriber.audioCaptureMode.usesMicrophone)
+        .disabled(
+            transcriber.isRecording
+                || transcriber.isSessionTransitionInProgress
+                || !transcriber.audioCaptureMode.usesMicrophone
+        )
         .help(transcriber.audioCaptureMode.usesMicrophone ? "選擇麥克風裝置" : "目前音訊來源不使用麥克風")
     }
 
@@ -365,7 +399,7 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .fixedSize()
-        .disabled(transcriber.isRecording)
+        .disabled(transcriber.isRecording || transcriber.isSessionTransitionInProgress)
         .help("重新整理麥克風清單")
     }
 
@@ -382,7 +416,7 @@ struct ContentView: View {
             }
             .menuStyle(.borderlessButton)
         }
-        .disabled(transcriber.isRecording)
+        .disabled(transcriber.isRecording || transcriber.isSessionTransitionInProgress)
         .help(transcriber.audioCaptureMode.helpText)
     }
 
@@ -394,7 +428,7 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .fixedSize()
-        .disabled(transcriber.isRecording)
+        .disabled(transcriber.isRecording || transcriber.isSessionTransitionInProgress)
         .help(transcriber.preflightUpdatedAtText)
         .accessibilityLabel("會前檢查")
         .keyboardShortcut("p", modifiers: [.command, .shift])
@@ -408,7 +442,7 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .fixedSize()
-        .disabled(transcriber.isRecording)
+        .disabled(transcriber.isRecording || transcriber.isSessionTransitionInProgress)
         .help("單獨測試螢幕與系統錄音權限與系統音訊 buffer，不會開麥克風")
         .accessibilityLabel("測試系統音訊")
         .keyboardShortcut("u", modifiers: [.command, .shift])
@@ -428,7 +462,7 @@ struct ContentView: View {
             }
             .menuStyle(.borderlessButton)
         }
-        .disabled(transcriber.isRecording)
+        .disabled(transcriber.isRecording || transcriber.isSessionTransitionInProgress)
         .help("SpeechAnalyzer 需要 macOS 26；較舊版本會使用 Apple Speech")
     }
 
@@ -440,7 +474,12 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .fixedSize()
-        .disabled(!transcriber.hasContent)
+        .disabled(
+            !transcriber.hasContent
+                || summaryReaderStatus.isHistorical
+                || transcriber.isSessionTransitionInProgress
+        )
+        .help(summaryReaderStatus.isHistorical ? "歷史會議為唯讀；先明確續錄後才能更新重點" : "依目前逐字稿更新會議重點")
     }
 
     private var settingsButton: some View {
@@ -462,7 +501,7 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .fixedSize()
-        .disabled(transcriber.isRecording)
+        .disabled(transcriber.isRecording || transcriber.isSessionTransitionInProgress)
         .help("重新檢查權限、麥克風與系統音訊")
     }
 
@@ -475,16 +514,28 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .fixedSize()
+        .disabled(transcriber.isSessionTransitionInProgress)
         .help("搜尋、載入或開啟已自動保存的會議")
     }
 
     private var clearButton: some View {
         Button {
-            transcriber.clear()
+            Task {
+                await transcriber.clear()
+            }
         } label: {
             Label("清空", systemImage: "trash")
         }
-        .disabled(!transcriber.hasContent)
+        .disabled(
+            !transcriber.hasContent
+                || transcriber.isRecording
+                || transcriber.isSessionTransitionInProgress
+        )
+        .help(
+            transcriber.isRecording || transcriber.isSessionTransitionInProgress
+                ? "請等待錄音停止或狀態切換完成後再清空"
+                : "清空目前會議內容"
+        )
     }
 
     private var copyTranscriptButton: some View {
@@ -524,6 +575,7 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .fixedSize()
+        .disabled(transcriber.isSessionTransitionInProgress)
         .help(transcriber.isRecording ? "停止並封存目前會議，建立下一場" : "封存目前會議，建立下一場")
         .accessibilityLabel("下一場會議")
         .keyboardShortcut("n", modifiers: [.command, .shift])
@@ -551,7 +603,37 @@ struct ContentView: View {
                 systemImage: "text.alignleft"
             )
 
-            TextEditor(text: $transcriber.transcript)
+            transcriptEditor
+
+            currentSegmentView
+        }
+        .padding(18)
+    }
+
+    @ViewBuilder
+    private var transcriptEditor: some View {
+        if transcriber.isViewingHistoricalSession {
+            ScrollView {
+                Text(transcriber.transcript.isEmpty ? "尚無逐字稿" : transcriber.transcript)
+                    .font(.system(size: 15, design: .rounded))
+                    .foregroundStyle(transcriber.transcript.isEmpty ? AppTheme.textSecondary : AppTheme.textPrimary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .padding(12)
+            }
+            .background(AppTheme.surface)
+            .clipShape(RoundedRectangle(cornerRadius: AppTheme.cardRadius, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: AppTheme.cardRadius, style: .continuous)
+                    .stroke(AppTheme.border, lineWidth: 1)
+            )
+            .accessibilityLabel("歷史逐字稿，唯讀")
+            .accessibilityHint("如需續錄請使用明確的續錄操作。")
+        } else {
+            TextEditor(text: Binding(
+                get: { transcriber.transcript },
+                set: { transcriber.updateTranscriptManually($0) }
+            ))
                 .font(.system(size: 15, design: .rounded))
                 .foregroundColor(AppTheme.textPrimary)
                 .tint(AppTheme.actionTeal)
@@ -563,10 +645,9 @@ struct ContentView: View {
                     RoundedRectangle(cornerRadius: AppTheme.cardRadius, style: .continuous)
                         .stroke(AppTheme.border, lineWidth: 1)
                 )
-
-            currentSegmentView
+                .disabled(transcriber.isSessionTransitionInProgress)
+                .accessibilityHint("可人工修正目前會議的逐字稿。")
         }
-        .padding(18)
     }
 
     private var summaryPane: some View {
@@ -577,24 +658,75 @@ struct ContentView: View {
                 systemImage: "list.bullet.clipboard"
             )
 
-            SummaryCoveragePanel()
+            summaryReader
 
-            TextEditor(text: $transcriber.meetingNotes)
-                .font(.system(size: 15, design: .rounded))
-                .foregroundColor(AppTheme.textPrimary)
-                .tint(AppTheme.actionTeal)
-                .scrollContentBackground(.hidden)
-                .padding(12)
-                .background(AppTheme.surface)
-                .clipShape(RoundedRectangle(cornerRadius: AppTheme.cardRadius, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: AppTheme.cardRadius, style: .continuous)
-                        .stroke(AppTheme.border, lineWidth: 1)
-                )
-
-            statusFooter
+            DisclosureGroup("技術狀態", isExpanded: $showingSummaryDiagnostics) {
+                statusFooter
+                    .padding(.top, 8)
+            }
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(AppTheme.textSecondary)
         }
         .padding(18)
+    }
+
+    private var summaryReader: some View {
+        MeetingSummaryReaderView(
+            document: transcriber.summaryDocument,
+            status: summaryReaderStatus,
+            rawMarkdown: transcriber.rawMeetingNotes,
+            onCopy: copyMeetingSummaryPayload,
+            onEditItem: summaryEditHandler
+        )
+    }
+
+    private var summaryEditHandler: ((MeetingSummaryManualEditRequest) -> Void)? {
+        guard !summaryReaderStatus.isHistorical,
+              !transcriber.isSessionTransitionInProgress else { return nil }
+        return updateMeetingSummaryItem
+    }
+
+    private var summaryReaderStatus: MeetingSummaryViewStatus {
+        let document = transcriber.summaryDocument
+        let hasStructuredContent = !document.headline.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !document.items.isEmpty
+        let phase: MeetingSummaryViewPhase
+        if transcriber.isViewingHistoricalSession {
+            phase = .historical
+        } else if !hasStructuredContent, let message = document.processing.lastError {
+            phase = .failed(message: message)
+        } else if transcriber.isSummaryRequestActive {
+            phase = .processing
+        } else if hasStructuredContent || document.processing.totalUnits > 0 {
+            phase = .ready
+        } else {
+            phase = .idle
+        }
+
+        return MeetingSummaryViewStatus(
+            phase: phase,
+            updatedAtText: transcriber.summaryUpdatedAtText
+        )
+    }
+
+    private func copyMeetingSummaryPayload(_ payload: MeetingSummaryCopyPayload) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(payload.text, forType: .string)
+        copiedMeetingNotes = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            copiedMeetingNotes = false
+        }
+    }
+
+    private func updateMeetingSummaryItem(_ request: MeetingSummaryManualEditRequest) {
+        transcriber.updateSummaryItem(
+            id: request.itemID,
+            text: request.text,
+            status: request.status,
+            owner: request.owner,
+            dueDate: request.dueDate
+        )
+        transcriber.setSummaryItemLocked(id: request.itemID, locked: request.lockAfterSaving)
     }
 
     private var currentSegmentView: some View {
@@ -688,7 +820,7 @@ struct ContentView: View {
                     Label("重測", systemImage: "checkmark.shield")
                 }
                 .controlSize(.small)
-                .disabled(transcriber.isRecording)
+                .disabled(transcriber.isRecording || transcriber.isSessionTransitionInProgress)
             }
         }
     }
@@ -703,8 +835,21 @@ struct ContentView: View {
     }
 
     private func copyMeetingNotes() {
+        let document = transcriber.summaryDocument
+        let hasStructuredContent = !document.headline.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !document.items.isEmpty
+        let text = hasStructuredContent
+            ? MeetingSummaryRenderer.render(
+                document,
+                options: .init(
+                    includeInactiveItems: true,
+                    includeProcessing: true,
+                    usesDenseTopicPreview: false
+                )
+            )
+            : transcriber.meetingNotesOutput()
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(transcriber.meetingNotesOutput(), forType: .string)
+        NSPasteboard.general.setString(text, forType: .string)
         copiedMeetingNotes = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
             copiedMeetingNotes = false
@@ -803,7 +948,7 @@ private struct MoMoWhisperOnboardingView: View {
                         } label: {
                             Label("測試系統音訊", systemImage: "speaker.wave.2")
                         }
-                        .disabled(transcriber.isRecording)
+                        .disabled(transcriber.isRecording || transcriber.isSessionTransitionInProgress)
 
                         Text(transcriber.systemAudioInputStatusText)
                             .font(.system(size: 12, weight: .semibold))
@@ -933,15 +1078,20 @@ private struct MeetingHistoryView: View {
 
             List {
                 ForEach(transcriber.meetingHistory) { metadata in
-                    MeetingHistoryRow(metadata: metadata) {
-                        transcriber.loadMeetingSession(metadata)
-                        dismiss()
-                    } resume: {
-                        transcriber.loadMeetingSession(metadata)
+                    MeetingHistoryRow(
+                        metadata: metadata,
+                        isMeaningfulForHandoff: transcriber.isMeetingMeaningfulForHandoff(metadata)
+                    ) {
                         Task {
-                            await transcriber.resumeCurrentMeetingSession()
+                            await transcriber.loadMeetingSession(metadata)
+                            dismiss()
                         }
-                        dismiss()
+                    } resume: {
+                        Task {
+                            await transcriber.loadMeetingSession(metadata)
+                            await transcriber.resumeCurrentMeetingSession()
+                            dismiss()
+                        }
                     } openFolder: {
                         transcriber.openMeetingSessionFolder(metadata)
                     } copyPath: {
@@ -971,6 +1121,7 @@ private struct MeetingHistoryView: View {
 @MainActor
 private struct MeetingHistoryRow: View {
     let metadata: MeetingSessionMetadata
+    let isMeaningfulForHandoff: Bool
     let load: () -> Void
     let resume: () -> Void
     let openFolder: () -> Void
@@ -983,13 +1134,13 @@ private struct MeetingHistoryRow: View {
                 HStack(spacing: 8) {
                     Text(metadata.displayTitle)
                         .font(.system(size: 15, weight: .semibold))
-                    Text(metadata.validityLabel)
+                    Text(isMeaningfulForHandoff ? "有效" : "空/測試")
                         .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(metadata.validityTone.color)
+                        .foregroundStyle(validityTone.color)
                         .padding(.horizontal, 7)
                         .padding(.vertical, 3)
                         .background(
-                            metadata.validityTone.color.opacity(0.10),
+                            validityTone.color.opacity(0.10),
                             in: RoundedRectangle(cornerRadius: AppTheme.controlRadius, style: .continuous)
                         )
                 }
@@ -1028,6 +1179,10 @@ private struct MeetingHistoryRow: View {
             .controlSize(.small)
         }
         .padding(.vertical, 6)
+    }
+
+    private var validityTone: TrustSignalTone {
+        isMeaningfulForHandoff ? .ready : .warning
     }
 }
 
@@ -1083,7 +1238,7 @@ private struct SummarySettingsView: View {
                             .foregroundStyle(.secondary)
                     }
 
-                    Text("預設只保留逐字稿。本機自動整理不連線第三方；只有明確選擇 DeepSeek、LM Studio 或其他 API 時，逐字稿才會送到你設定的 endpoint。")
+                    Text("預設只保留逐字稿。本機自動整理不連線第三方；只有明確選擇 DeepSeek、LM Studio 或其他 API 時，待整理逐字稿、最近上下文，以及既有重點目錄的 headline、主題 ID／標題／別名、項目 ID／主題／類型／狀態／文字／負責人／期限／鎖定狀態，才會送到你設定的 endpoint。原始音訊不會送出。")
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                 }
