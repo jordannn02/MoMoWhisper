@@ -29,7 +29,7 @@ final class MeetingSummaryCoreTests: XCTestCase {
         XCTAssertEqual(result.topics.count, 1)
         XCTAssertEqual(result.topics.first?.id, "topic-a")
         XCTAssertEqual(result.items.first?.topicID, "topic-a")
-        XCTAssertEqual(result.topics.first?.aliases, ["release planning"])
+        XCTAssertEqual(result.topics.first?.aliases, ["release planning", "topic b"])
     }
 
     func testReplayingSameDeltaTwentyTimesIsIdempotent() {

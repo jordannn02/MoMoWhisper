@@ -38,6 +38,10 @@ func testDuplicateTopicAndDeltaReplay() throws {
     }
     try expect(once.topics.count == 1, "duplicate topics were not collapsed")
     try expect(once.items.first?.topicID == "a", "duplicate topic item was not remapped")
+    try expect(
+        once.topics.first?.aliases == ["release planning", "b"],
+        "duplicate topic title and provider ID aliases were not preserved"
+    )
     try expect(replayed == once, "delta replay was not idempotent")
 }
 
