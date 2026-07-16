@@ -8,11 +8,23 @@ private actor PersistenceWriterProbe {
     private(set) var activeWriters = 0
     private(set) var maximumConcurrentWriters = 0
     var delayNanoseconds: UInt64 = 0
+    private var startedRevisions: Set<UInt64> = []
+    private var startWaiters: [UInt64: [CheckedContinuation<Void, Never>]] = [:]
+    private var blockedRevision: UInt64?
+    private var blockedWriteContinuation: CheckedContinuation<Void, Never>?
 
     func write(token: PersistenceRevisionToken, payload: Int) async throws -> Int {
         activeWriters += 1
         maximumConcurrentWriters = max(maximumConcurrentWriters, activeWriters)
         revisions.append(token.revision)
+        startedRevisions.insert(token.revision)
+        let waiters = startWaiters.removeValue(forKey: token.revision) ?? []
+        waiters.forEach { $0.resume() }
+        if blockedRevision == token.revision {
+            await withCheckedContinuation { continuation in
+                blockedWriteContinuation = continuation
+            }
+        }
         if delayNanoseconds > 0 {
             try await Task.sleep(nanoseconds: delayNanoseconds)
         }
@@ -22,6 +34,23 @@ private actor PersistenceWriterProbe {
 
     func snapshot() -> (revisions: [UInt64], maximumConcurrentWriters: Int) {
         (revisions, maximumConcurrentWriters)
+    }
+
+    func waitUntilStarted(revision: UInt64) async {
+        guard !startedRevisions.contains(revision) else { return }
+        await withCheckedContinuation { continuation in
+            startWaiters[revision, default: []].append(continuation)
+        }
+    }
+
+    func blockWrite(revision: UInt64) {
+        blockedRevision = revision
+    }
+
+    func releaseBlockedWrite() {
+        blockedRevision = nil
+        blockedWriteContinuation?.resume()
+        blockedWriteContinuation = nil
     }
 }
 
@@ -61,7 +90,7 @@ final class LatestWinsPersistenceCoordinatorTests: XCTestCase {
 
     func testWriterIsSerializedWhileNewestQueuedRevisionSurvives() async throws {
         let probe = PersistenceWriterProbe()
-        await probe.setDelayForTesting(60_000_000)
+        await probe.blockWrite(revision: 1)
         let coordinator = LatestWinsPersistenceCoordinator<Int, Int> { token, payload in
             try await probe.write(token: token, payload: payload)
         }
@@ -73,20 +102,26 @@ final class LatestWinsPersistenceCoordinatorTests: XCTestCase {
                 payload: 1
             )
         }
-        try await Task.sleep(nanoseconds: 10_000_000)
+        await probe.waitUntilStarted(revision: 1)
 
         var queued: [Task<LatestWinsPersistenceOutcome<Int>, Error>] = []
+        var previous: Task<LatestWinsPersistenceOutcome<Int>, Error>?
         for revision in 2...20 {
-            queued.append(Task {
+            let current = Task {
                 try await coordinator.submit(
                     token: .init(sessionID: sessionID, epoch: 1, revision: UInt64(revision)),
                     payload: revision,
                     debounceNanoseconds: 0
                 )
-            })
-            await Task.yield()
+            }
+            queued.append(current)
+            if let previous {
+                _ = try await previous.value
+            }
+            previous = current
         }
 
+        await probe.releaseBlockedWrite()
         _ = try await first.value
         for task in queued {
             _ = try await task.value
