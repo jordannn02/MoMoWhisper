@@ -44,6 +44,25 @@ public struct DeliveryArtifactCheck: Equatable, Sendable, Identifiable {
 }
 
 public enum DeliveryArtifactInspector {
+    public static func inspectTextContent(
+        label: String,
+        text: String,
+        sourcePath: String,
+        minimumCharacters: Int
+    ) -> DeliveryArtifactCheck {
+        let count = text.trimmingCharacters(in: .whitespacesAndNewlines).count
+        return result(
+            label: label,
+            path: sourcePath,
+            state: count >= minimumCharacters ? .ready : .belowThreshold,
+            exists: true,
+            isReadable: true,
+            measuredCount: count,
+            requiredCount: minimumCharacters,
+            unit: "字"
+        )
+    }
+
     public static func inspectTextFile(
         label: String,
         path: String,

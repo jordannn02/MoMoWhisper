@@ -1,4 +1,5 @@
 import SwiftUI
+import MoMoWhisperSummaryCore
 
 enum AppTheme {
     static let background = Color(hex: 0xE8EFEC)
@@ -76,15 +77,18 @@ enum TrustSignalTone {
 }
 
 extension MeetingSessionMetadata {
-    var isMeaningfulForHandoff: Bool {
-        transcriptCharacterCount >= 300 || highlightCharacterCount >= 80
+    func isMeaningfulForHandoff(summaryDocument: MeetingSummaryDocument?) -> Bool {
+        MeetingSummaryHandoffValidity.isValid(
+            transcriptCharacterCount: transcriptCharacterCount,
+            summaryDocument: summaryDocument
+        )
     }
 
-    var validityLabel: String {
-        isMeaningfulForHandoff ? "有效" : "空/測試"
+    func validityLabel(summaryDocument: MeetingSummaryDocument?) -> String {
+        isMeaningfulForHandoff(summaryDocument: summaryDocument) ? "有效" : "空/測試"
     }
 
-    var validityTone: TrustSignalTone {
-        isMeaningfulForHandoff ? .ready : .warning
+    func validityTone(summaryDocument: MeetingSummaryDocument?) -> TrustSignalTone {
+        isMeaningfulForHandoff(summaryDocument: summaryDocument) ? .ready : .warning
     }
 }

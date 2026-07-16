@@ -1,4 +1,5 @@
 import Foundation
+import MoMoWhisperSummaryCore
 
 struct LiveMeetingSummaryState: Codable, Equatable, Sendable {
     struct TopicSummary: Codable, Equatable, Sendable {
@@ -179,6 +180,16 @@ struct LiveMeetingSummaryState: Codable, Equatable, Sendable {
     }
 }
 
+extension LiveMeetingSummaryState {
+    var legacySummaryState: LegacyMeetingSummaryState {
+        LegacyMeetingSummaryState(
+            topics: topics.map {
+                .init(topic: $0.topic, conclusion: $0.conclusion, openItems: $0.openItems)
+            }
+        )
+    }
+}
+
 final class DeepSeekMeetingSummarizer: @unchecked Sendable {
     struct Configuration: Sendable {
         var baseURL: URL
@@ -187,31 +198,31 @@ final class DeepSeekMeetingSummarizer: @unchecked Sendable {
     }
 
     private let configuration: Configuration
+    private let session: URLSession
     private(set) var lastDiagnostics: DeepSeekMeetingDiagnostics?
     private static let requestTimeoutSeconds: TimeInterval = 45
     private static let liveSummaryMaxTokens = 1_600
     private static let finalSummaryMaxTokens = 2_800
     private static let maxRequestAttempts = 3
 
-    init(configuration: Configuration) {
+    init(configuration: Configuration, session: URLSession = .shared) {
         self.configuration = configuration
+        self.session = session
     }
 
     func summarize(
         newTranscript: String,
         recentTranscript: String,
-        currentState: LiveMeetingSummaryState,
+        currentCatalog: String,
         isFinal: Bool
-    ) async throws -> LiveMeetingSummaryState {
-        let currentStateData = try JSONEncoder().encode(currentState)
-        let currentStateJSON = String(data: currentStateData, encoding: .utf8) ?? #"{"topics":[]}"#
+    ) async throws -> MeetingSummaryDelta {
         let modeInstruction = isFinal
-            ? "這是停止錄音後的最後梳理。請重新壓縮目前 JSON 狀態，新增逐字稿只代表尚未吸收的尾段，不要把最近上下文重複寫成新議題。"
-            : "這是錄音中的分段增量更新。請只吸收新增逐字稿中的新資訊，保留既有重點，不要重複議題。"
+            ? "這是停止錄音後的最後梳理。可用 resolve_item 或 supersede_item 收斂既有項目；不要重送未變更的項目。"
+            : "這是錄音中的分段增量更新。只輸出新增或需要更新的操作；不要重送完整摘要。"
 
         let userContent = """
-        目前會議狀態 JSON：
-        \(currentStateJSON)
+        目前摘要索引（僅供去重與最後收斂，不可原樣回傳）：
+        \(currentCatalog)
 
         \(modeInstruction)
 
@@ -238,13 +249,17 @@ final class DeepSeekMeetingSummarizer: @unchecked Sendable {
         return try await performSummaryRequest(requestBody)
     }
 
-    private func performSummaryRequest(_ requestBody: DeepSeekChatRequest) async throws -> LiveMeetingSummaryState {
+    private func performSummaryRequest(_ requestBody: DeepSeekChatRequest) async throws -> MeetingSummaryDelta {
         var lastError: Error?
         var requestBody = requestBody
 
         for attempt in 1...Self.maxRequestAttempts {
+            try Task.checkCancellation()
+
             do {
                 return try await performSingleSummaryRequest(requestBody)
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 lastError = error
 
@@ -257,14 +272,14 @@ final class DeepSeekMeetingSummarizer: @unchecked Sendable {
                 }
 
                 let delay = UInt64(attempt * attempt) * 1_000_000_000
-                try? await Task.sleep(nanoseconds: delay)
+                try await Task.sleep(nanoseconds: delay)
             }
         }
 
         throw lastError ?? DeepSeekMeetingError.emptyResponse(finishReason: nil, reasoningContent: nil)
     }
 
-    private func performSingleSummaryRequest(_ requestBody: DeepSeekChatRequest) async throws -> LiveMeetingSummaryState {
+    private func performSingleSummaryRequest(_ requestBody: DeepSeekChatRequest) async throws -> MeetingSummaryDelta {
         var request = URLRequest(url: Self.chatCompletionsURL(from: configuration.baseURL))
         request.httpMethod = "POST"
         request.timeoutInterval = Self.requestTimeoutSeconds
@@ -272,7 +287,7 @@ final class DeepSeekMeetingSummarizer: @unchecked Sendable {
         request.setValue("Bearer \(configuration.apiKey)", forHTTPHeaderField: "Authorization")
         request.httpBody = try JSONEncoder().encode(requestBody)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await session.data(for: request)
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw DeepSeekMeetingError.invalidResponse("DeepSeek 沒有回傳 HTTP 狀態。")
@@ -283,7 +298,7 @@ final class DeepSeekMeetingSummarizer: @unchecked Sendable {
         }
 
         lastDiagnostics = try? DeepSeekMeetingResponseParser.diagnostics(from: data)
-        return try DeepSeekMeetingResponseParser.parseState(from: data)
+        return try DeepSeekMeetingResponseParser.parseDelta(from: data)
     }
 
     private static func shouldRetry(_ error: Error) -> Bool {
@@ -300,24 +315,28 @@ final class DeepSeekMeetingSummarizer: @unchecked Sendable {
     }
 
     private static let systemPrompt = """
-    你是即時會議重點整理器。請只整理三種資訊：
-    1. 議題主題
-    2. 主題結論
-    3. 主題未確認事項
+    你是即時會議重點的增量整理器。應用程式本機是摘要狀態的唯一擁有者；你只能回傳 delta operations，絕對不要回傳或覆誦完整摘要狀態。
 
-    輸出要非常精簡，像會議旁聽筆記，不要寫摘要作文：
-    - topic：短名詞，最多 16 個中文字。
-    - conclusion：一個短句或用頓號分隔的短列點，最多 40 個中文字。
-    - open_items：每項最多 30 個中文字。
-    - 只記決議、狀態、待辦、風險、卡點；不要補背景，不要解釋脈絡。
-    - 沒有明確結論時，conclusion 留空字串，不要硬湊。
+    規則：
+    - topic 標題最多 16 個中文字；item 每項一個原子資訊，最多 48 個中文字。
+    - item kind 只能是 decision、requirement、action、open_question、risk、fact、note。
+    - status 只能是 confirmed、proposed、open、resolved、superseded、unknown。
+    - 沒有逐字稿證據時不得新增；不得推測負責人、期限或確認狀態。
+    - 未明確確認的內容用 proposed 或 unknown；問題與待辦通常用 open。
+    - 即時更新只新增或更新真正改變的項目；無新增資訊時 operations 回空陣列。
+    - 最後梳理可使用 resolve_item；若新項目取代舊項目，使用 supersede_item 並提供 replacement。
+    - id 必須簡短、穩定且在目前回應中唯一。重用摘要索引內既有項目時必須沿用其 id。
 
-    請合併目前 JSON 狀態與新增逐字稿，不要重複議題，不要捏造逐字稿沒有說的內容。
-    如果目前 JSON 狀態已經有 topics，即使新增逐字稿沒有新的明確資訊，也必須保留既有 topics，不可回覆空陣列。
-回覆必須是 JSON，格式如下：
-{"topics":[{"topic":"...","conclusion":"...","open_items":["..."]}]}
-只有在目前 JSON 狀態與新增逐字稿都尚無資訊時，才回覆 {"topics":[]}
-"""
+    僅回傳 JSON：
+    {"delta_id":"batch-唯一值","operations":[
+      {"op":"set_headline","headline":"一句話摘要"},
+      {"op":"upsert_topic","id":"topic-id","title":"主題","aliases":[],"order":0},
+      {"op":"upsert_item","id":"item-id","topic_id":"topic-id","kind":"decision","status":"confirmed","text":"原子重點","owner":null,"due_date":null,"order":0},
+      {"op":"resolve_item","id":"既有-item-id"},
+      {"op":"supersede_item","id":"既有-item-id","replacement":{"id":"新-item-id","topic_id":"topic-id","kind":"decision","status":"confirmed","text":"取代內容","owner":null,"due_date":null,"order":0}}
+    ]}
+    不可輸出 Markdown、程式碼圍欄、目前摘要全文或 processing 數字。
+    """
 
     private static func decodeMeetingState(from content: String) throws -> LiveMeetingSummaryState {
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -429,10 +448,16 @@ private struct DeepSeekChatResponse: Decodable {
     struct Usage: Decodable {
         var promptCacheHitTokens: Int?
         var promptCacheMissTokens: Int?
+        var promptTokens: Int?
+        var completionTokens: Int?
+        var totalTokens: Int?
 
         enum CodingKeys: String, CodingKey {
             case promptCacheHitTokens = "prompt_cache_hit_tokens"
             case promptCacheMissTokens = "prompt_cache_miss_tokens"
+            case promptTokens = "prompt_tokens"
+            case completionTokens = "completion_tokens"
+            case totalTokens = "total_tokens"
         }
     }
 }
@@ -441,6 +466,9 @@ struct DeepSeekMeetingDiagnostics: Equatable, Sendable {
     var finishReason: String?
     var promptCacheHitTokens: Int
     var promptCacheMissTokens: Int
+    var promptTokens: Int
+    var completionTokens: Int
+    var totalTokens: Int
 
     var cacheHitRate: Double {
         let total = promptCacheHitTokens + promptCacheMissTokens
@@ -453,9 +481,38 @@ struct DeepSeekMeetingDiagnostics: Equatable, Sendable {
 }
 
 enum DeepSeekMeetingResponseParser {
+    static func parseDeltaContent(_ content: String) throws -> MeetingSummaryDelta {
+        try decodeMeetingDelta(from: content)
+    }
+
+    static func parseDelta(from data: Data) throws -> MeetingSummaryDelta {
+        let decoded = try JSONDecoder().decode(DeepSeekChatResponse.self, from: data)
+        let content = try responseContent(from: decoded)
+        return try decodeMeetingDelta(from: content)
+    }
+
     static func parseState(from data: Data) throws -> LiveMeetingSummaryState {
         let decoded = try JSONDecoder().decode(DeepSeekChatResponse.self, from: data)
-        guard let firstChoice = decoded.choices.first else {
+        let content = try responseContent(from: decoded)
+        return try decodeMeetingState(from: content)
+    }
+
+    static func diagnostics(from data: Data) throws -> DeepSeekMeetingDiagnostics {
+        let decoded = try JSONDecoder().decode(DeepSeekChatResponse.self, from: data)
+        let firstChoice = decoded.choices.first
+
+        return DeepSeekMeetingDiagnostics(
+            finishReason: firstChoice?.finishReason,
+            promptCacheHitTokens: decoded.usage?.promptCacheHitTokens ?? 0,
+            promptCacheMissTokens: decoded.usage?.promptCacheMissTokens ?? 0,
+            promptTokens: decoded.usage?.promptTokens ?? 0,
+            completionTokens: decoded.usage?.completionTokens ?? 0,
+            totalTokens: decoded.usage?.totalTokens ?? 0
+        )
+    }
+
+    private static func responseContent(from response: DeepSeekChatResponse) throws -> String {
+        guard let firstChoice = response.choices.first else {
             throw DeepSeekMeetingError.emptyResponse(finishReason: nil, reasoningContent: nil)
         }
 
@@ -470,19 +527,139 @@ enum DeepSeekMeetingResponseParser {
                 reasoningContent: firstChoice.message.reasoningContent
             )
         }
-
-        return try decodeMeetingState(from: content)
+        return content
     }
 
-    static func diagnostics(from data: Data) throws -> DeepSeekMeetingDiagnostics {
-        let decoded = try JSONDecoder().decode(DeepSeekChatResponse.self, from: data)
-        let firstChoice = decoded.choices.first
+    private static func decodeMeetingDelta(from content: String) throws -> MeetingSummaryDelta {
+        guard content.utf8.count <= 1_000_000 else {
+            throw DeepSeekMeetingError.invalidResponse("delta JSON 超過 1 MB 安全上限。")
+        }
+        let data = try extractedJSONObjectData(from: content)
+        do {
+            let wire = try JSONDecoder().decode(MeetingSummaryDeltaWire.self, from: data)
+            let deltaID = wire.deltaID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !deltaID.isEmpty else {
+                throw DeepSeekMeetingError.invalidResponse("delta_id 不可空白。")
+            }
+            return MeetingSummaryDelta(
+                id: deltaID,
+                operations: try wire.operations.map(makeOperation)
+            )
+        } catch let error as DeepSeekMeetingError {
+            throw error
+        } catch {
+            throw DeepSeekMeetingError.invalidResponse("delta JSON schema 不符：\(error.localizedDescription)")
+        }
+    }
 
-        return DeepSeekMeetingDiagnostics(
-            finishReason: firstChoice?.finishReason,
-            promptCacheHitTokens: decoded.usage?.promptCacheHitTokens ?? 0,
-            promptCacheMissTokens: decoded.usage?.promptCacheMissTokens ?? 0
+    private static func makeOperation(_ wire: MeetingSummaryDeltaWire.Operation) throws -> MeetingSummaryDeltaOperation {
+        switch wire.op {
+        case "set_headline":
+            return .setHeadline(try required(wire.headline, field: "headline"))
+        case "upsert_topic":
+            return .upsertTopic(try makeTopic(wire))
+        case "upsert_item":
+            return .upsertItem(try makeItem(wire))
+        case "resolve_item":
+            return .resolveItem(id: try required(wire.id, field: "id"), source: .ai)
+        case "supersede_item":
+            guard let replacement = wire.replacement else {
+                throw DeepSeekMeetingError.invalidResponse("supersede_item 缺少 replacement。")
+            }
+            return .supersedeItem(
+                id: try required(wire.id, field: "id"),
+                replacement: try makeItem(replacement),
+                source: .ai
+            )
+        default:
+            throw DeepSeekMeetingError.invalidResponse("不支援的 delta op：\(wire.op)")
+        }
+    }
+
+    private static func makeTopic(_ wire: MeetingSummaryDeltaWire.Operation) throws -> MeetingSummaryTopic {
+        MeetingSummaryTopic(
+            id: try required(wire.id, field: "id"),
+            title: try required(wire.title, field: "title"),
+            aliases: wire.aliases ?? [],
+            order: max(0, wire.order ?? 0)
         )
+    }
+
+    private static func makeItem(_ wire: MeetingSummaryDeltaWire.Operation) throws -> MeetingSummaryItem {
+        MeetingSummaryItem(
+            id: try required(wire.id, field: "id"),
+            topicID: try required(wire.topicID, field: "topic_id"),
+            kind: try itemKind(wire.kind),
+            status: try itemStatus(wire.status),
+            text: try required(wire.text, field: "text"),
+            owner: wire.owner,
+            dueDate: wire.dueDate,
+            source: .ai,
+            order: max(0, wire.order ?? 0)
+        )
+    }
+
+    private static func makeItem(_ wire: MeetingSummaryDeltaWire.Item) throws -> MeetingSummaryItem {
+        MeetingSummaryItem(
+            id: try required(wire.id, field: "replacement.id"),
+            topicID: try required(wire.topicID, field: "replacement.topic_id"),
+            kind: try itemKind(wire.kind),
+            status: try itemStatus(wire.status),
+            text: try required(wire.text, field: "replacement.text"),
+            owner: wire.owner,
+            dueDate: wire.dueDate,
+            source: .ai,
+            order: max(0, wire.order ?? 0)
+        )
+    }
+
+    private static func itemKind(_ value: String?) throws -> MeetingSummaryItem.Kind {
+        switch value {
+        case "decision": return .decision
+        case "requirement": return .requirement
+        case "action": return .action
+        case "open_question": return .openQuestion
+        case "risk": return .risk
+        case "fact": return .fact
+        case "note": return .note
+        default: throw DeepSeekMeetingError.invalidResponse("不支援的 item kind：\(value ?? "nil")")
+        }
+    }
+
+    private static func itemStatus(_ value: String?) throws -> MeetingSummaryItem.Status {
+        switch value {
+        case "confirmed": return .confirmed
+        case "proposed": return .proposed
+        case "open": return .open
+        case "resolved": return .resolved
+        case "superseded": return .superseded
+        case "unknown": return .unknown
+        default: throw DeepSeekMeetingError.invalidResponse("不支援的 item status：\(value ?? "nil")")
+        }
+    }
+
+    private static func required(_ value: String?, field: String) throws -> String {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmed.isEmpty else {
+            throw DeepSeekMeetingError.invalidResponse("delta 欄位 \(field) 不可空白。")
+        }
+        return trimmed
+    }
+
+    private static func extractedJSONObjectData(from content: String) throws -> Data {
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let data = trimmed.data(using: .utf8),
+           (try? JSONSerialization.jsonObject(with: data)) != nil {
+            return data
+        }
+
+        guard let start = trimmed.firstIndex(of: "{"),
+              let end = trimmed.lastIndex(of: "}"),
+              start <= end,
+              let data = String(trimmed[start...end]).data(using: .utf8) else {
+            throw DeepSeekMeetingError.invalidResponse("找不到 delta JSON object。")
+        }
+        return data
     }
 
     private static func decodeMeetingState(from content: String) throws -> LiveMeetingSummaryState {
@@ -508,6 +685,70 @@ enum DeepSeekMeetingResponseParser {
         } catch {
             throw DeepSeekMeetingError.invalidResponse(content)
         }
+    }
+}
+
+private struct MeetingSummaryDeltaWire: Decodable {
+    struct Item: Decodable {
+        var id: String?
+        var topicID: String?
+        var kind: String?
+        var status: String?
+        var text: String?
+        var owner: String?
+        var dueDate: String?
+        var order: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case id
+            case topicID = "topic_id"
+            case kind
+            case status
+            case text
+            case owner
+            case dueDate = "due_date"
+            case order
+        }
+    }
+
+    struct Operation: Decodable {
+        var op: String
+        var id: String?
+        var headline: String?
+        var title: String?
+        var aliases: [String]?
+        var topicID: String?
+        var kind: String?
+        var status: String?
+        var text: String?
+        var owner: String?
+        var dueDate: String?
+        var order: Int?
+        var replacement: Item?
+
+        enum CodingKeys: String, CodingKey {
+            case op
+            case id
+            case headline
+            case title
+            case aliases
+            case topicID = "topic_id"
+            case kind
+            case status
+            case text
+            case owner
+            case dueDate = "due_date"
+            case order
+            case replacement
+        }
+    }
+
+    var deltaID: String
+    var operations: [Operation]
+
+    enum CodingKeys: String, CodingKey {
+        case deltaID = "delta_id"
+        case operations
     }
 }
 

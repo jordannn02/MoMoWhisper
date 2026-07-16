@@ -32,8 +32,16 @@ struct MoMoWhisperApp: App {
 
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
+    private enum TerminationState {
+        case idle
+        case flushing
+        case approved
+    }
+
     private let transcriber = SpeechTranscriptionService()
     private var window: NSWindow?
+    private var terminationState: TerminationState = .idle
+    private var terminationTask: Task<Void, Never>?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -43,6 +51,38 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemVali
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         showMainWindow()
         return true
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        switch terminationState {
+        case .approved:
+            return .terminateNow
+        case .flushing:
+            return .terminateLater
+        case .idle:
+            break
+        }
+
+        window?.makeFirstResponder(nil)
+        window?.ignoresMouseEvents = true
+        terminationState = .flushing
+        terminationTask = Task { @MainActor [weak self] in
+            guard let self else {
+                sender.reply(toApplicationShouldTerminate: false)
+                return
+            }
+            let saved = await transcriber.prepareForTermination()
+            terminationTask = nil
+            if saved {
+                terminationState = .approved
+            } else {
+                terminationState = .idle
+                window?.ignoresMouseEvents = false
+                showMainWindow()
+            }
+            sender.reply(toApplicationShouldTerminate: saved)
+        }
+        return .terminateLater
     }
 
     private func showMainWindow() {
@@ -69,6 +109,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemVali
     }
 
     func requestSystemAudioTest() {
+        guard terminationState == .idle else { return }
         showMainWindow()
         Task { @MainActor in
             await transcriber.testSystemAudioCapture()
@@ -76,6 +117,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemVali
     }
 
     func requestRecordingToggle() {
+        guard terminationState == .idle else { return }
         showMainWindow()
         Task { @MainActor in
             await transcriber.toggleRecording()

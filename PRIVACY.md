@@ -12,6 +12,8 @@ On a new macOS installation, MoMoWhisper stores its data under:
 
 This includes meeting metadata, transcripts, recordings, highlights, diagnostics, and optional Codex handoff files. MoMoWhisper does not silently migrate these files to iCloud.
 
+For a committed macOS meeting, the complete source of truth is the local `session_state_v1.json` envelope. The authoritative structured summary is at `#/snapshot/summaryDocument`, and the authoritative transcript and metadata are in the same snapshot. Files such as `summary_document.json`, `transcript.md`, `metadata.json`, and `highlights.md` are mutable compatibility previews for legacy tools and convenient reading; they can be replaced by a later save and must not be treated as an independently committed version.
+
 The Windows Beta stores its local data separately under:
 
 ```text
@@ -48,11 +50,21 @@ The Windows Beta uses the bundled whisper.cpp executable and multilingual model 
 New macOS installations default to **transcript only**, with summary transmission disabled. The Windows Beta has no remote summary-provider feature.
 
 - **Local automatic summary** uses MoMoWhisper's local fallback and does not contact a third-party summary endpoint.
-- **DeepSeek** sends transcript excerpts, recent context, and current summary state to the DeepSeek-compatible endpoint only after you select DeepSeek and save its settings.
-- **Other OpenAI-compatible API** sends the same class of meeting text to the endpoint you configure only after you select that provider.
+- **DeepSeek** sends committed transcript excerpts, recent text context, and the existing summary catalog fields needed for continuity: headline; topic ID, title, and aliases; and item ID, topic ID, type, status, text, owner, due date, and manual-lock state. This happens only after you select DeepSeek and save its settings.
+- **Other OpenAI-compatible API** sends the same class of meeting text and summary catalog fields to the endpoint you configure only after you select that provider.
 - **LM Studio** sends meeting text to the endpoint you configure only after you select LM Studio. A localhost endpoint normally remains on the same computer; a remote URL sends data to that remote operator.
 
 MoMoWhisper does not scan Downloads, environment variables, or legacy handoff files for API tokens. API keys entered in the app are stored in macOS Keychain. Review the privacy and retention terms of every endpoint you configure.
+
+Summary-provider requests do not include raw meeting audio. Cancelling or switching a meeting cancels pending retry work; the app validates persisted retry ranges against the current committed transcript before any retry request is sent.
+
+## macOS session persistence and handoff consistency
+
+Routine macOS autosaves are coalesced for 250 milliseconds with same-session latest-wins behavior and are written by one serialized background writer. A write that has already started is allowed to finish, while stop, clear/session-switch, and final-export boundaries use a zero-delay flush. This changes when local files are committed; it does not add a network destination or telemetry.
+
+The macOS Codex handoff schema v2 contains `sessionTransactionID` and `sessionStatePath`. The app treats a handoff as ready only after reading the referenced `session_state_v1.json` and checking its transaction ID, meeting ID, schema, path boundary, and decodable snapshot structure. Missing, stale, mismatched, path-escaping, or structurally invalid evidence fails closed. This consistency check is not a cryptographic signature or MAC and does not claim to detect a deliberate rewrite of both the envelope and its references. Compatibility-preview paths in the handoff remain untrusted pointers. The Windows Beta uses the separate `momowhisper.windows-beta.v2` handoff format and does not implement this macOS transaction chain.
+
+Handoff files can expose meeting titles, local absolute paths, recording status, and summary-processing metadata even when they do not embed the full transcript. Treat them as meeting data, and redact or remove them before sharing diagnostics or filing a public issue.
 
 ## Telemetry
 
@@ -60,7 +72,7 @@ MoMoWhisper does not include first-party analytics, advertising, crash-reporting
 
 ## Retention and deletion
 
-Files remain until you delete them. Removing either app does not automatically delete meeting files; removing the macOS app also does not automatically delete Keychain entries. Windows Beta recordings and transcripts are not encrypted by the app, so use operating-system disk encryption and normal account protections when required. Before sharing diagnostics or opening a public issue, remove meeting titles, transcripts, paths, tokens, and other private information.
+Files remain until you delete them. Removing either app does not automatically delete meeting files; removing the macOS app also does not automatically delete Keychain entries. On both macOS and Windows, recordings, transcripts, JSON, and Markdown meeting artifacts are not encrypted by MoMoWhisper itself. Use FileVault or BitLocker, normal account protections, and the security controls of any selected sync destination when required. Before sharing diagnostics or opening a public issue, remove meeting titles, transcripts, paths, tokens, and other private information.
 
 ## Recording consent
 

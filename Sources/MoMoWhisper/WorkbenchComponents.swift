@@ -325,7 +325,7 @@ struct LatestValidHandoffCard: View {
             return "目前只看到空會議或測試會議；這會避免 Codex 誤讀 0 字最新會議。"
         }
         let fileState = transcriber.latestValidCodexHandoffReady
-            ? "會議 ID 相符，逐字稿或重點檔可讀且達門檻"
+            ? "會議 ID 相符，且逐字稿達門檻或 Summary V2 含人工確認內容"
             : "檔案存在本身不等於可交付，請看下方檢查"
         return "\(metadata.displayTitle) · \(metadata.transcriptCharacterCount) 字逐字稿 · \(metadata.highlightCharacterCount) 字重點 · \(fileState)"
     }

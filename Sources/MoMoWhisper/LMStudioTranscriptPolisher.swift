@@ -1,4 +1,5 @@
 import Foundation
+import MoMoWhisperSummaryCore
 
 final class LMStudioTranscriptPolisher: @unchecked Sendable {
     struct Configuration: Sendable {
@@ -8,6 +9,7 @@ final class LMStudioTranscriptPolisher: @unchecked Sendable {
     }
 
     private let configuration: Configuration
+    private(set) var lastDiagnostics: LMStudioSummaryDiagnostics?
     private static let requestTimeoutSeconds: TimeInterval = 45
     private static let inputLimit = 18_000
 
@@ -15,21 +17,34 @@ final class LMStudioTranscriptPolisher: @unchecked Sendable {
         self.configuration = configuration
     }
 
-    func summarizeMeeting(_ transcript: String) async throws -> String {
+    func summarizeMeeting(
+        _ transcript: String,
+        currentCatalog: String,
+        isFinal: Bool
+    ) async throws -> MeetingSummaryDelta {
         let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
-            return ""
+            return MeetingSummaryDelta(id: "lmstudio-empty", operations: [])
         }
 
         let input = trimmed.count > Self.inputLimit ? String(trimmed.suffix(Self.inputLimit)) : trimmed
+        let requestInput = """
+        目前摘要索引（只供去重，不可回傳完整狀態）：
+        \(currentCatalog)
+
+        模式：\(isFinal ? "最後梳理；可 resolve/supersede" : "即時增量；只新增真正的新資訊")
+
+        新增逐字稿：
+        \(input)
+        """
         if configuration.baseURL.path.contains("chat/completions") {
-            return try await summarizeWithOpenAICompatibleRequest(input)
+            return try await summarizeWithOpenAICompatibleRequest(requestInput)
         }
 
-        return try await summarizeWithPublicChatRequest(input)
+        return try await summarizeWithPublicChatRequest(requestInput)
     }
 
-    private func summarizeWithPublicChatRequest(_ input: String) async throws -> String {
+    private func summarizeWithPublicChatRequest(_ input: String) async throws -> MeetingSummaryDelta {
         let requestBody = LMStudioPublicChatRequest(
             model: configuration.model,
             systemPrompt: Self.summaryPrompt,
@@ -42,15 +57,25 @@ final class LMStudioTranscriptPolisher: @unchecked Sendable {
 
         let data = try await sendJSONRequest(requestBody)
         let decoded = try JSONDecoder().decode(LMStudioPublicChatResponse.self, from: data)
+        if decoded.finishReason == "length" {
+            throw LMStudioPolishError.truncatedResponse
+        }
         guard let content = decoded.bestContent?.trimmingCharacters(in: .whitespacesAndNewlines),
               !content.isEmpty else {
             throw LMStudioPolishError.emptyResponse
         }
 
-        return content
+        let delta = try DeepSeekMeetingResponseParser.parseDeltaContent(content)
+        lastDiagnostics = LMStudioSummaryDiagnostics(
+            finishReason: decoded.finishReason,
+            inputTokens: decoded.usage?.inputTokens ?? 0,
+            outputTokens: decoded.usage?.outputTokens ?? 0,
+            operationCount: delta.operations.count
+        )
+        return delta
     }
 
-    private func summarizeWithOpenAICompatibleRequest(_ input: String) async throws -> String {
+    private func summarizeWithOpenAICompatibleRequest(_ input: String) async throws -> MeetingSummaryDelta {
         let requestBody = LMStudioChatRequest(
             model: configuration.model,
             messages: [
@@ -64,12 +89,25 @@ final class LMStudioTranscriptPolisher: @unchecked Sendable {
 
         let data = try await sendJSONRequest(requestBody)
         let decoded = try JSONDecoder().decode(LMStudioChatResponse.self, from: data)
-        guard let content = decoded.choices.first?.message.content.trimmingCharacters(in: .whitespacesAndNewlines),
-              !content.isEmpty else {
+        guard let firstChoice = decoded.choices.first else {
+            throw LMStudioPolishError.emptyResponse
+        }
+        if firstChoice.finishReason == "length" {
+            throw LMStudioPolishError.truncatedResponse
+        }
+        let content = firstChoice.message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !content.isEmpty else {
             throw LMStudioPolishError.emptyResponse
         }
 
-        return content
+        let delta = try DeepSeekMeetingResponseParser.parseDeltaContent(content)
+        lastDiagnostics = LMStudioSummaryDiagnostics(
+            finishReason: firstChoice.finishReason,
+            inputTokens: decoded.usage?.promptTokens ?? 0,
+            outputTokens: decoded.usage?.completionTokens ?? 0,
+            operationCount: delta.operations.count
+        )
+        return delta
     }
 
     private func sendJSONRequest<T: Encodable>(_ body: T) async throws -> Data {
@@ -92,11 +130,12 @@ final class LMStudioTranscriptPolisher: @unchecked Sendable {
     }
 
     private static let summaryPrompt = """
-    請把會議逐字稿整理成繁體中文，且只保留三個區塊：
-    ## 議題主題
-    ## 主題結論
-    ## 主題未確認事項
-    不要加入逐字稿沒有出現的資訊。
+    你是會議重點增量整理器。本機 reducer 是狀態唯一擁有者；只回傳 delta，不可回傳完整摘要或 Markdown。
+    topic 最多 16 個中文字；每個 item 是一項原子資訊，最多 48 個中文字。不得捏造負責人、期限或確認狀態。
+    kind 只能是 decision、requirement、action、open_question、risk、fact、note。
+    status 只能是 confirmed、proposed、open、resolved、superseded、unknown。
+    回傳：{"delta_id":"唯一值","operations":[{"op":"upsert_topic","id":"topic-id","title":"主題"},{"op":"upsert_item","id":"item-id","topic_id":"topic-id","kind":"note","status":"unknown","text":"重點"}]}
+    最後梳理才可依摘要索引使用 resolve_item 或 supersede_item；無新增資訊時 operations 為空陣列。
     """
 
     private static func responsePreview(from data: Data) -> String {
@@ -125,6 +164,16 @@ private struct LMStudioPublicChatRequest: Encodable {
 }
 
 private struct LMStudioPublicChatResponse: Decodable {
+    struct Usage: Decodable {
+        let inputTokens: Int?
+        let outputTokens: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case inputTokens = "input_tokens"
+            case outputTokens = "output_tokens"
+        }
+    }
+
     struct OutputItem: Decodable {
         let type: String?
         let content: String?
@@ -132,6 +181,15 @@ private struct LMStudioPublicChatResponse: Decodable {
 
     let output: [OutputItem]?
     let content: String?
+    let finishReason: String?
+    let usage: Usage?
+
+    enum CodingKeys: String, CodingKey {
+        case output
+        case content
+        case finishReason = "finish_reason"
+        case usage
+    }
 
     var bestContent: String? {
         output?.compactMap(\.content).first(where: { !$0.isEmpty }) ?? content
@@ -166,15 +224,40 @@ private struct LMStudioChatResponse: Decodable {
         }
 
         var message: Message
+        var finishReason: String?
+
+        enum CodingKeys: String, CodingKey {
+            case message
+            case finishReason = "finish_reason"
+        }
     }
 
     var choices: [Choice]
+    var usage: Usage?
+
+    struct Usage: Decodable {
+        var promptTokens: Int?
+        var completionTokens: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case promptTokens = "prompt_tokens"
+            case completionTokens = "completion_tokens"
+        }
+    }
+}
+
+struct LMStudioSummaryDiagnostics: Equatable, Sendable {
+    var finishReason: String?
+    var inputTokens: Int
+    var outputTokens: Int
+    var operationCount: Int
 }
 
 enum LMStudioPolishError: LocalizedError {
     case invalidConfiguration(String)
     case invalidResponse(String)
     case emptyResponse
+    case truncatedResponse
 
     var errorDescription: String? {
         switch self {
@@ -184,6 +267,8 @@ enum LMStudioPolishError: LocalizedError {
             return "LM Studio 回傳格式無法解析：\(message)"
         case .emptyResponse:
             return "LM Studio 沒有回傳可用內容。"
+        case .truncatedResponse:
+            return "LM Studio delta 回覆遭輸出上限截斷。"
         }
     }
 }
